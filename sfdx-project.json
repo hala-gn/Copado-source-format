@@ -7,6 +7,6 @@
   ],
   "name": "CopadoHackathonProject",
   "namespace": "",
-  "sfdcLoginUrl": "https://salesforce.com",
+  "sfdcLoginUrl": "https://login.salesforce.com",
   "sourceApiVersion": "67.0"
 }
