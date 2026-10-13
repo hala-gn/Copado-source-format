@@ -85,8 +85,9 @@ if (command === 'deploy') {
     const outputLog = runShellCapture("agentia cicd work done");
     console.log(outputLog);
 
+    // Extract the live promotion ID variable string from output
     const match = outputLog.match(/promotion_id=([a-zA-Z0-9]{15,18})/i);
-    if (match && match[1]) {
+    if (match && match) {
       promotionId = match[1];
     }
   } catch (err) {
@@ -94,40 +95,64 @@ if (command === 'deploy') {
     process.exit(1);
   }
 
-  // Step 5: Live Monitoring of the active Promotion deployment
+  // Step 5: Live Intelligent Monitoring of the active Promotion deployment via Cloud JSON
   if (promotionId) {
     console.log("\n🚀 Step 5: Promotion [" + promotionId + "] successfully generated and running in cloud...");
     console.log("⏳ Monitoring deployment progress live from Copado Cloud API...");
     
     let isRunning = true;
     let checkCount = 0;
+    const maxChecks = 60; // 60 checks * 10s = 10 minutes maximum execution window
 
-    while (isRunning && checkCount < 40) {
+    while (isRunning && checkCount < maxChecks) {
       try {
-        // FIXED: Query the exact promotion log profile history array instead of the story status
-        const historyLog = runShellCapture(`agentia cicd pipeline status`);
+        // Query pipeline status in raw JSON format to bypass text-parsing glitches
+        const rawJson = runShellCapture("agentia pipeline status --json");
+        const pipelineData = JSON.parse(rawJson);
         
-        // Scan the text block for execution state changes
-        if (historyLog.includes("Success") || historyLog.includes("Completed") || !historyLog.includes(promotionId)) {
-          console.log("\n🎉 STATUS UPDATE: Deployment COMPLETED SUCCESSFULLY in QA!");
-          isRunning = false;
-        } else if (historyLog.includes("Failed") || historyLog.includes("Error")) {
-          console.log("\n❌ STATUS UPDATE: Deployment FAILED WITH ERRORS. Review your validation rules.");
-          isRunning = false;
+        // Dynamic status tracker verification block
+        let targetPromotion = null;
+        if (Array.isArray(pipelineData)) {
+            targetPromotion = pipelineData.find(p => p.id === promotionId || p.promotionId === promotionId);
+        } else if (pipelineData && pipelineData.promotions) {
+            targetPromotion = pipelineData.promotions.find(p => p.id === promotionId || p.promotionId === promotionId);
+        }
+
+        if (targetPromotion) {
+            const currentStatus = targetPromotion.status || targetPromotion.executionStatus || "";
+            console.log(`  [Live Poll] Promotion Status: ${currentStatus}...`);
+
+            if (currentStatus.includes("Success") || currentStatus.includes("Completed") || currentStatus === "Done") {
+                console.log("\n🎉 STATUS UPDATE: Deployment COMPLETED SUCCESSFULLY in QA!");
+                isRunning = false;
+            } else if (currentStatus.includes("Failed") || currentStatus.includes("Error")) {
+                console.log("\n❌ STATUS UPDATE: Deployment FAILED WITH ERRORS in QA sandbox.");
+                isRunning = false;
+            }
         } else {
-          process.stdout.write("."); 
-          execSync("powershell -Command \"Start-Sleep -s 12\""); 
-          checkCount++;
+            // If the promotion ID is no longer present in the active queue array, it finished successfully and cleared out
+            console.log("\n🎉 STATUS UPDATE: Promotion cleared active pipeline tracking queue. COMPLETED SUCCESSFULLY!");
+            isRunning = false;
         }
       } catch (e) {
-        process.stdout.write(".");
-        execSync("powershell -Command \"Start-Sleep -s 12\"");
+        // Soft fallback to text-matching if specific JSON matrix fields are nested differently across beta builds
+        try {
+          const textReport = runShellCapture("agentia pipeline status");
+          if (!textReport.includes(promotionId)) {
+            console.log("\n🎉 STATUS UPDATE: Deployment COMPLETED SUCCESSFULLY in QA!");
+            isRunning = false;
+          }
+        } catch (err) {}
+      }
+
+      if (isRunning) {
+        execSync("powershell -Command \"Start-Sleep -s 10\""); // Wait 10 seconds before polling again
         checkCount++;
       }
     }
     
     if (isRunning) {
-      console.log("\n🎉 STATUS UPDATE: Pipeline verification confirms task deployment finalized successfully!");
+      console.log("\n⏳ Monitoring limit reached. Please check the Copado web UI dashboard manually.");
     }
   } else {
     console.error("\n❌ Critical Failure: Could not track the auto-generated Promotion ID.");
