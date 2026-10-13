@@ -103,5 +103,3 @@ else {
   console.log("Valid commands are: deploy, undo");
   process.exit(1);
 }
-
-```
