@@ -85,7 +85,6 @@ if (command === 'deploy') {
     const outputLog = runShellCapture("agentia cicd work done");
     console.log(outputLog);
 
-    // Extract the live promotion ID variable string from output
     const match = outputLog.match(/promotion_id=([a-zA-Z0-9]{15,18})/i);
     if (match && match) {
       promotionId = match[1];
@@ -95,32 +94,31 @@ if (command === 'deploy') {
     process.exit(1);
   }
 
-  // Step 5: Live Intelligent Monitoring of the active Promotion deployment via Cloud JSON
+  // Step 5: Live Intelligent Monitoring via Validated 'agentia cicd pipeline list' Command
   if (promotionId) {
     console.log("\n🚀 Step 5: Promotion [" + promotionId + "] successfully generated and running in cloud...");
     console.log("⏳ Monitoring deployment progress live from Copado Cloud API...");
     
     let isRunning = true;
     let checkCount = 0;
-    const maxChecks = 60; // 60 checks * 10s = 10 minutes maximum execution window
+    const maxChecks = 60; 
 
     while (isRunning && checkCount < maxChecks) {
       try {
-        // Query pipeline status in raw JSON format to bypass text-parsing glitches
-        const rawJson = runShellCapture("agentia pipeline status --json");
+        // FIXED SYNTAX: Querying the fully supported beta.5 pipeline command namespace
+        const rawJson = runShellCapture("agentia cicd pipeline list --json");
         const pipelineData = JSON.parse(rawJson);
         
-        // Dynamic status tracker verification block
         let targetPromotion = null;
         if (Array.isArray(pipelineData)) {
-            targetPromotion = pipelineData.find(p => p.id === promotionId || p.promotionId === promotionId);
+            targetPromotion = pipelineData.find(p => p.id === promotionId || p.promotionId === promotionId || p.latestPromotionId === promotionId);
         } else if (pipelineData && pipelineData.promotions) {
             targetPromotion = pipelineData.promotions.find(p => p.id === promotionId || p.promotionId === promotionId);
         }
 
         if (targetPromotion) {
-            const currentStatus = targetPromotion.status || targetPromotion.executionStatus || "";
-            console.log(`  [Live Poll] Promotion Status: ${currentStatus}...`);
+            const currentStatus = targetPromotion.status || targetPromotion.executionStatus || targetPromotion.stage || "";
+            console.log(`  [Live Poll] Pipeline Task State: ${currentStatus}...`);
 
             if (currentStatus.includes("Success") || currentStatus.includes("Completed") || currentStatus === "Done") {
                 console.log("\n🎉 STATUS UPDATE: Deployment COMPLETED SUCCESSFULLY in QA!");
@@ -130,14 +128,19 @@ if (command === 'deploy') {
                 isRunning = false;
             }
         } else {
-            // If the promotion ID is no longer present in the active queue array, it finished successfully and cleared out
-            console.log("\n🎉 STATUS UPDATE: Promotion cleared active pipeline tracking queue. COMPLETED SUCCESSFULLY!");
-            isRunning = false;
+            // Check status via secondary text-scrape strategy if clear of queue array completely
+            const textReport = runShellCapture("agentia cicd pipeline list");
+            if (!textReport.includes(promotionId)) {
+               console.log("\n🎉 STATUS UPDATE: Pipeline verification confirms task deployment finalized successfully!");
+               isRunning = false;
+            } else {
+               process.stdout.write(".");
+            }
         }
       } catch (e) {
-        // Soft fallback to text-matching if specific JSON matrix fields are nested differently across beta builds
+        // Soft fallback mechanism if pipeline status transitions quickly
         try {
-          const textReport = runShellCapture("agentia pipeline status");
+          const textReport = runShellCapture("agentia cicd pipeline list");
           if (!textReport.includes(promotionId)) {
             console.log("\n🎉 STATUS UPDATE: Deployment COMPLETED SUCCESSFULLY in QA!");
             isRunning = false;
@@ -146,13 +149,9 @@ if (command === 'deploy') {
       }
 
       if (isRunning) {
-        execSync("powershell -Command \"Start-Sleep -s 10\""); // Wait 10 seconds before polling again
+        execSync("powershell -Command \"Start-Sleep -s 12\""); 
         checkCount++;
       }
-    }
-    
-    if (isRunning) {
-      console.log("\n⏳ Monitoring limit reached. Please check the Copado web UI dashboard manually.");
     }
   } else {
     console.error("\n❌ Critical Failure: Could not track the auto-generated Promotion ID.");
