@@ -134,91 +134,124 @@ if (command === 'deploy') {
   }
 
   // Step 4: Run 'work done' to finalize user story and initiate cloud deployment
-  console.log("\nStep 4: Finalizing User Story state and initiating Promotion...");
-  let promotionId    = "";
-  let jobExecutionId = "";
+console.log("\nStep 4: Finalizing User Story state and initiating Promotion...");
+let promotionId    = "";
+let jobExecutionId = "";
 
-  try {
-    const outputLog = runShellCapture("agentia cicd work done");
-    console.log(outputLog);
+try {
+  const outputLog = runShellCapture("agentia cicd work done");
+  console.log(outputLog);
 
-    // Extract IDs from the work done output
-    const promoMatch = outputLog.match(/promotion_id=([a-zA-Z0-9]{15,18})/i);
-    if (promoMatch && promoMatch[1]) promotionId = promoMatch[1];
+  // Extract IDs from plain text output
+  const promoMatch = outputLog.match(/promotion_id=([a-zA-Z0-9]{15,18})/i);
+  if (promoMatch && promoMatch[1]) promotionId = promoMatch[1];
 
-    const jobMatch = outputLog.match(/job_execution_id=([a-zA-Z0-9]{15,18})/i);
-    if (jobMatch && jobMatch[1]) jobExecutionId = jobMatch[1];
+  const jobMatch = outputLog.match(/job_execution_id=([a-zA-Z0-9]{15,18})/i);
+  if (jobMatch && jobMatch[1]) jobExecutionId = jobMatch[1];
 
-    // Fallback: also try to parse as JSON in case agentia outputs JSON
-    if (!jobExecutionId) {
-      try {
-        const parsed = JSON.parse(outputLog);
-        jobExecutionId = parsed.jobExecutionId || parsed.job_execution_id || parsed.jobExecution?.id || "";
-        promotionId    = promotionId || parsed.promotionId || parsed.promotion_id || parsed.promotion?.id || "";
-      } catch (_) { /* not JSON, that is fine */ }
+  // Fallback: try parsing as JSON
+  if (!jobExecutionId) {
+    try {
+      const parsed = JSON.parse(outputLog);
+      jobExecutionId = parsed.jobExecutionId
+                    || parsed.job_execution_id
+                    || (parsed.jobExecution && parsed.jobExecution.id)
+                    || "";
+      promotionId    = promotionId
+                    || parsed.promotionId
+                    || parsed.promotion_id
+                    || (parsed.promotion && parsed.promotion.id)
+                    || "";
+    } catch (_) {}
+  }
+} catch (err) {
+  console.error("Critical Failure during work serialization milestone execution.");
+  process.exit(1);
+}
+
+if (promotionId)    console.log(`  Promotion ID      : ${promotionId}`);
+if (jobExecutionId) console.log(`  Job Execution ID  : ${jobExecutionId}`);
+
+// Step 5: Poll using the correct Copado CLI command with correct field names
+// Official command: sf copado:job:status -i <jobId> --json
+// Official JSON response field: jobStatus (not "status")
+// Terminal values per Copado docs: Successful, Failed, Cancelled
+console.log("\nStep 5: Polling promotion status via sf copado:job:status...");
+console.log("        Mirrors the exact status shown in the Copado UI.\n");
+
+const TERMINAL_STATES = ["SUCCESSFUL", "SUCCESS", "COMPLETED", "FAILED", "ERROR", "CANCELLED", "CONFLICT"];
+let isRunning  = true;
+let checkCount = 0;
+const maxChecks = 60;
+
+while (isRunning && checkCount < maxChecks) {
+  let jobStatus = null;
+
+  if (jobExecutionId) {
+    try {
+      // Use the documented colon-syntax command and documented field name
+      const rawJson  = runShellCapture(`sf copado:job:status -i ${jobExecutionId} --json`);
+      const parsed   = JSON.parse(rawJson);
+
+      // Copado returns "jobStatus" at the top level, with a "steps" array
+      jobStatus      = (parsed.jobStatus || parsed.status || "IN PROGRESS").toUpperCase();
+      const steps    = Array.isArray(parsed.steps) ? parsed.steps : [];
+
+      console.log("--------------------------------------------------------------------");
+      console.log(`  JOB EXECUTION ID : ${jobExecutionId}`);
+      console.log(`  OVERALL STATUS   : ${jobStatus}`);
+
+      if (steps.length > 0) {
+        console.log("  STEP BREAKDOWN:");
+        steps.forEach((step, idx) => {
+          const name   = (step.name || step.apiName || `Step ${idx + 1}`).padEnd(40);
+          const status = (step.status || "UNKNOWN").toUpperCase();
+          const icon   = status.includes("SUCCESS") || status.includes("COMPLET") ? " OK "
+                       : status.includes("FAIL")    || status.includes("ERROR")   ? "FAIL"
+                       : status.includes("SKIP")                                   ? "SKIP"
+                       : "....";
+          console.log(`    [${icon}] ${name} -> ${status}`);
+        });
+      }
+      console.log("--------------------------------------------------------------------\n");
+
+    } catch (err) {
+      console.log(`  [Tick ${checkCount + 1}] Could not query job status: ${err.message}`);
+      console.log("  Retrying in 12s...\n");
     }
-  } catch (err) {
-    console.error("Critical Failure during work serialization milestone execution.");
-    process.exit(1);
+  } else {
+    // No jobExecutionId captured: fall back to generic work status
+    try {
+      const fallback = runShellCapture("agentia cicd work status");
+      console.log("  [Fallback - no Job Execution ID] Generic work status:");
+      console.log("  " + fallback.split('\n')[0]);
+      jobStatus = fallback.toUpperCase();
+    } catch (_) {}
   }
 
-  if (promotionId)    console.log(`\n  Promotion ID      : ${promotionId}`);
-  if (jobExecutionId) console.log(`  Job Execution ID  : ${jobExecutionId}`);
-
-  // Step 5: Precise Promotion Status Polling using sf copado job status
-  // This is the same data source the Copado UI reads, so statuses will match exactly.
-  console.log("\nStep 5: Polling promotion status via Copado CLI (sf copado job status)...");
-  console.log("        This mirrors the exact status shown in the Copado UI.\n");
-
-  let isRunning  = true;
-  let checkCount = 0;
-  const maxChecks = 60;
-
-  while (isRunning && checkCount < maxChecks) {
-    const jobStatus = printPromotionStatus(jobExecutionId);
-
-    if (jobStatus === null) {
-      // CLI query failed; fall back to generic work status for this tick only
-      try {
-        const fallback = runShellCapture("agentia cicd work status");
-        console.log("  [Fallback] Generic work status:", fallback.split('\n')[0]);
-      } catch (_) {}
-    }
-
-    if (jobStatus && (
-      jobStatus.includes("SUCCESS") ||
-      jobStatus.includes("COMPLET") ||
-      jobStatus.includes("SUCCESSFUL")
-    )) {
+  // Check for terminal states
+  if (jobStatus && TERMINAL_STATES.some(s => jobStatus.includes(s))) {
+    if (jobStatus.includes("FAIL") || jobStatus.includes("ERROR") || jobStatus.includes("CANCEL") || jobStatus.includes("CONFLICT")) {
+      console.log("DEPLOYMENT FAILED OR CANCELLED. Review your validation constraints in the Copado UI.");
+    } else {
       console.log("DEPLOYMENT COMPLETED SUCCESSFULLY in QA environment!");
-      isRunning = false;
-      break;
     }
-
-    if (jobStatus && (
-      jobStatus.includes("FAIL") ||
-      jobStatus.includes("ERROR") ||
-      jobStatus.includes("CONFLICT")
-    )) {
-      console.log("DEPLOYMENT FAILED WITH ERRORS. Review your validation constraints.");
-      isRunning = false;
-      break;
-    }
-
-    if (isRunning) {
-      console.log(`  [Tick ${checkCount + 1}/${maxChecks}] Status still IN PROGRESS. Waiting 12s...\n`);
-      execSync("powershell -Command \"Start-Sleep -s 12\"");
-      checkCount++;
-    }
+    isRunning = false;
+    break;
   }
 
-  if (isRunning) {
-    console.log("\nPolling window closed. Run the command below to check the final status manually:");
-    if (jobExecutionId) {
-      console.log(`  sf copado job status -i ${jobExecutionId} --json`);
-    }
-    console.log("Or open the Promotion record in the Copado UI.");
+  console.log(`  [Tick ${checkCount + 1}/${maxChecks}] Status still IN PROGRESS. Waiting 12s...\n`);
+  execSync("powershell -Command \"Start-Sleep -s 12\"");
+  checkCount++;
+}
+
+if (isRunning) {
+  console.log("\nPolling window closed before a terminal status was reached.");
+  if (jobExecutionId) {
+    console.log("Run this command manually to check the final status:");
+    console.log(`  sf copado:job:status -i ${jobExecutionId} --json`);
   }
+  console.log("Or open the Promotion record in the Copado UI.");
 }
 
 // ─── PART 2: THE EMERGENCY RECOVERY ROLLBACK ENGINE ───────────────────────────
