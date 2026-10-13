@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<ValidationRule xmlns="http://soap.sforce.com/2006/04/metadata">
+    <fullName>Ensure_Description_For_Prospect_Accounts</fullName>
+    <active>true</active>
+    <description>Forces users to provide a detailed description whenever an account type is set to Prospect.</description>
+    <errorConditionFormula>AND(
+    ISPICKVAL(Type, &quot;Prospect&quot;),
+    ISBLANK(Description)
+)</errorConditionFormula>
+    <errorDisplayField>Description</errorDisplayField>
+    <errorMessage>A prospect account must have a description populated. Please provide details before saving.</errorMessage>
+</ValidationRule>
