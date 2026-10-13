@@ -87,55 +87,72 @@ if (command === 'deploy') {
 
     const match = outputLog.match(/promotion_id=([a-zA-Z0-9]{15,18})/i);
     if (match && match) {
-      promotionId = match;
+      promotionId = match[1];
     }
   } catch (err) {
     console.error("❌ Failed to complete work done milestone configuration.");
     process.exit(1);
   }
 
-  // Step 5: Real-time Cloud Deployment Status Polling
+  // Step 5: Real-time Cloud Deployment Status Polling via Native JSON Parsing
   console.log("\n🚀 Step 5: Monitoring active deployment tracking logs from Copado Cloud...");
   
   let isRunning = true;
   let checkCount = 0;
-  const maxChecks = 60; // 60 checks * 10s sleep = 10 minutes maximum window limit
+  const maxChecks = 60; // 10-minute maximum safety loop boundary window
 
   while (isRunning && checkCount < maxChecks) {
     try {
-      // Pull down the comprehensive text logs from the active work status channel
-      const rawStatusText = runShellCapture("agentia cicd work status");
+      // FIXED: Query work status in pure JSON format to bypass text-parsing gaps entirely
+      const rawJson = runShellCapture("agentia cicd work status --json");
+      const statusObj = JSON.parse(rawJson);
       
-      // Clean out the background terminal task headers to look exclusively at the execution results
-      const statusBlock = rawStatusText.replace(/Fetching status.*?\.\.\.\s*done/gi, "").trim();
+      // Extract structural properties depending on active user story array layout structures
+      let jobStatus = "";
+      if (statusObj && statusObj.status) {
+         jobStatus = statusObj.status;
+      } else if (statusObj && statusObj.latestJobStatus) {
+         jobStatus = statusObj.latestJobStatus;
+      } else if (statusObj && statusObj.executionStatus) {
+         jobStatus = statusObj.executionStatus;
+      }
 
-      // Case 1: Detect explicit Active deployment tracks
-      if (statusBlock.includes("In Progress") || statusBlock.includes("Running") || statusBlock.includes("Submitting")) {
-         console.log("  [Live Update] Deployment Status: IN PROGRESS...");
-      } 
-      // Case 2: Detect clear cloud failure indicators
-      else if (statusBlock.includes("Failed") || statusBlock.includes("Error") || statusBlock.includes("with errors")) {
-         console.log("\n❌ STATUS UPDATE: Deployment COMPLETED WITH ERRORS. Review your validation rules.");
-         isRunning = false;
-         break;
-      } 
-      // Case 3: Detect clear execution success states
-      else if (statusBlock.includes("Success") || statusBlock.includes("Completed") || statusBlock.includes("done")) {
+      console.log(`  [Live Update] Cloud System Job State: ${jobStatus || "IN PROGRESS"}...`);
+
+      // Evaluate the pure backend variable keys cleanly
+      if (jobStatus === "Success" || jobStatus === "Completed" || jobStatus === "Done") {
          console.log("\n🎉 STATUS UPDATE: Deployment COMPLETED SUCCESSFULLY in QA!");
          isRunning = false;
          break;
-      } 
-      // Default: If the buffer is completely empty or transient, consider it processing in the pipe
-      else {
-         console.log("  [Live Update] Deployment Status: IN PROGRESS...");
+      } else if (jobStatus === "Failed" || jobStatus === "Error" || jobStatus === "Completed with errors") {
+         console.log("\n❌ STATUS UPDATE: Deployment COMPLETED WITH ERRORS. Review your validation rules.");
+         isRunning = false;
+         break;
       }
     } catch (e) {
-      // Protect against transient network drops by assuming it's still running
-      console.log("  [Live Update] Deployment Status: IN PROGRESS...");
+      // Soft text check fallback context block if JSON formatting changes natively mid-run
+      try {
+        const rawStatusText = runShellCapture("agentia cicd work status");
+        const statusBlock = rawStatusText.replace(/Fetching status.*?\.\.\.\s*done/gi, "").trim();
+        
+        if (statusBlock.includes("Success") || statusBlock.includes("Completed")) {
+          console.log("\n🎉 STATUS UPDATE: Deployment COMPLETED SUCCESSFULLY in QA!");
+          isRunning = false;
+          break;
+        } else if (statusBlock.includes("Failed") || statusBlock.includes("Error")) {
+          console.log("\n❌ STATUS UPDATE: Deployment COMPLETED WITH ERRORS.");
+          isRunning = false;
+          break;
+        } else {
+          console.log("  [Live Update] Deployment Status: IN PROGRESS...");
+        }
+      } catch (err) {
+        console.log("  [Live Update] Deployment Status: IN PROGRESS...");
+      }
     }
 
     if (isRunning) {
-      execSync("powershell -Command \"Start-Sleep -s 10\""); // Wait 10 seconds before polling the API again
+      execSync("powershell -Command \"Start-Sleep -s 12\""); // Dynamic poll frequency spacing interval
       checkCount++;
     }
   }
