@@ -1,290 +1,432 @@
 #!/usr/bin/env node
+'use strict';
+
+/**
+ * copado-hx.js : headless Copado deploy + local snapshot rollback
+ *
+ *   node copado-hx.js deploy <UserStoryName>
+ *   node copado-hx.js undo   <UserStoryName> [--delete-new]
+ *
+ * Env (.env supported):
+ *   TARGET_ORG         sf alias of the org the promotion deploys to (default: qa)
+ *   COPADO_UI_URL      e.g. https://yourorg.lightning.force.com  (prints UI links)
+ *   POLL_INTERVAL_MS   status poll interval (default 10000)
+ *   MAX_POLL_MINUTES   give up polling after N minutes (default 30)
+ */
 
 const { execSync } = require('child_process');
 const fs = require('fs');
 const path = require('path');
 
-try { require('dotenv').config(); } catch (e) {}
+try { require('dotenv').config(); } catch (e) { /* dotenv optional */ }
 
-const [,, command, storyId] = process.argv;
+const [,, command, storyId, ...flags] = process.argv;
 
-const SOURCE_ORG = process.env.SOURCE_ORG || "dev1";
-const TARGET_ORG = process.env.TARGET_ORG || "qa";
+const TARGET_ORG       = process.env.TARGET_ORG || 'qa';
+const COPADO_UI_URL    = (process.env.COPADO_UI_URL || '').replace(/\/$/, '');
+const POLL_INTERVAL_MS = Number(process.env.POLL_INTERVAL_MS || 10000);
+const MAX_POLL_MINUTES = Number(process.env.MAX_POLL_MINUTES || 30);
+
+const TERMINAL_OK   = ['SUCCESS', 'COMPLETED'];
+const TERMINAL_FAIL = ['FAIL', 'ERROR', 'CANCEL', 'ABORT'];
+
+const line = (c = '=') => console.log(c.repeat(68));
 
 if (!command || !storyId) {
-  console.log("====================================================================");
-  console.log("ERROR: Missing execution parameters.");
-  console.log("Usage:");
-  console.log("  node copado-hx.js deploy <UserStoryName>  -> Run Headless Snapshot Release");
-  console.log("  node copado-hx.js undo <UserStoryName>    -> Trigger Local Automated Rollback");
-  console.log("====================================================================");
+  line();
+  console.log('ERROR: Missing execution parameters.');
+  console.log('Usage:');
+  console.log('  node copado-hx.js deploy <UserStoryName>                 -> Headless promotion + snapshot');
+  console.log('  node copado-hx.js undo   <UserStoryName> [--delete-new]  -> Local automated rollback');
+  line();
   process.exit(1);
 }
 
-function runShell(cmd) {
-  return execSync(cmd, { encoding: 'utf8', stdio: 'inherit' });
+// storyId ends up in shell commands and file paths: whitelist it.
+if (!/^[A-Za-z0-9_.-]+$/.test(storyId)) {
+  console.error(`Invalid user story name "${storyId}". Allowed: letters, digits, _ . -`);
+  process.exit(1);
 }
 
-function runShellCapture(cmd) {
-  return execSync(cmd, { encoding: 'utf8' }).trim();
+// ─── helpers ─────────────────────────────────────────────────────────────────
+function run(cmd, opts = {}) {
+  execSync(cmd, { stdio: 'inherit', ...opts });
 }
 
-// ─── PROMOTION STATUS DISPLAY HELPER ──────────────────────────────────────────
-// Official Copado CLI command per docs: sf copado job status --jobid <id> --json
-// Official response fields: jobStatus (string), steps (array of JobStep__c)
-function printPromotionStatus(jobExecutionId) {
-  if (!jobExecutionId) {
-    console.log("  [Status] No Job Execution ID captured. Cannot query precise status.");
-    return null;
-  }
-
-  let parsed = null;
+// Returns { ok, out, err }. Never throws. Keeps stdout even on non-zero exit,
+// because `sf ... --json` prints its error payload to stdout.
+function capture(cmd, opts = {}) {
   try {
-    // --jobid is the correct flag name per Copado CLI docs
-    const rawJson = runShellCapture(`sf copado job status --jobid ${jobExecutionId} --json`);
-    parsed = JSON.parse(rawJson);
-  } catch (err) {
-    console.log("  [Status] CLI query failed:", err.message);
+    const out = execSync(cmd, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], ...opts });
+    return { ok: true, out: out.trim(), err: '' };
+  } catch (e) {
+    return { ok: false, out: (e.stdout || '').toString().trim(), err: (e.stderr || e.message || '').toString().trim() };
+  }
+}
+
+function sleep(ms) {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms); // cross-platform, no powershell
+}
+
+function tryJson(text) {
+  try { return JSON.parse(text); } catch (_) {
+    // CLI sometimes prints warnings before the JSON body
+    const i = text.indexOf('{');
+    if (i > 0) { try { return JSON.parse(text.slice(i)); } catch (_) { /* fallthrough */ } }
     return null;
   }
+}
 
-  // Copado returns "jobStatus" at the top level per the Jobs Domain docs
-  const jobStatus = (parsed.jobStatus || parsed.status || "UNKNOWN").toUpperCase();
-  const steps     = Array.isArray(parsed.steps) ? parsed.steps : [];
+// Depth-first search for the first value under any of the given key names.
+function findKey(obj, names) {
+  if (!obj || typeof obj !== 'object') return undefined;
+  for (const n of names) if (obj[n] !== undefined && obj[n] !== null && obj[n] !== '') return obj[n];
+  for (const k of Object.keys(obj)) {
+    const v = findKey(obj[k], names);
+    if (v !== undefined) return v;
+  }
+  return undefined;
+}
 
-  console.log("--------------------------------------------------------------------");
+function classify(status) {
+  const s = (status || '').toUpperCase();
+  if (TERMINAL_FAIL.some(t => s.includes(t))) return 'FAILED';
+  if (TERMINAL_OK.some(t => s.includes(t)))   return 'SUCCESS';
+  return 'RUNNING';
+}
+
+function writeJson(file, data) {
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  fs.writeFileSync(file, JSON.stringify(data, null, 2));
+}
+
+// ─── file path -> metadata member mapping (needed for per-component snapshot) ─
+function toMetadata(file) {
+  const p = file.replace(/\\/g, '/');
+  const m = p.match(/main\/default\/([^/]+)\/(.+)$/);
+  if (!m) return null;
+  const [, folder, rest] = m;
+  const base = path.posix.basename(rest).replace(/-meta\.xml$/, '').replace(/\.[^.]+$/, '');
+  const simple = {
+    classes: 'ApexClass', triggers: 'ApexTrigger', pages: 'ApexPage', components: 'ApexComponent',
+    flexipages: 'FlexiPage', layouts: 'Layout', permissionsets: 'PermissionSet', flows: 'Flow',
+    tabs: 'CustomTab', staticresources: 'StaticResource', customMetadata: 'CustomMetadata',
+    profiles: 'Profile', labels: 'CustomLabels', applications: 'CustomApplication'
+  };
+  if (simple[folder]) return { type: simple[folder], name: base };
+  if (folder === 'lwc')  return { type: 'LightningComponentBundle', name: rest.split('/')[0] };
+  if (folder === 'aura') return { type: 'AuraDefinitionBundle',     name: rest.split('/')[0] };
+  if (folder === 'objects') {
+    const parts = rest.split('/');
+    if (parts.length <= 2) return { type: 'CustomObject', name: parts[0] };
+    const sub = { fields: 'CustomField', validationRules: 'ValidationRule', recordTypes: 'RecordType',
+                  listViews: 'ListView', webLinks: 'WebLink', compactLayouts: 'CompactLayout' }[parts[1]];
+    if (sub) return { type: sub, name: `${parts[0]}.${base}` };
+  }
+  return null;
+}
+
+// ─── Copado status display ───────────────────────────────────────────────────
+// Official: sf copado job status --jobid <id> --json  -> { jobStatus, steps[] }
+function fetchJob(jobExecutionId) {
+  const r = capture(`sf copado job status --jobid ${jobExecutionId} --json`);
+  const parsed = tryJson(r.out);
+  if (!parsed) return { error: r.err || r.out || 'empty response' };
+  return {
+    status: (findKey(parsed, ['jobStatus', 'status']) || 'UNKNOWN').toString().toUpperCase(),
+    steps: (() => { const s = findKey(parsed, ['steps']); return Array.isArray(s) ? s : []; })()
+  };
+}
+
+function renderJob(jobExecutionId, job) {
+  line('-');
   console.log(`  JOB EXECUTION ID : ${jobExecutionId}`);
-  console.log(`  OVERALL STATUS   : ${jobStatus}`);
-
-  if (steps.length > 0) {
-    console.log("  STEP BREAKDOWN (mirrors Copado UI):");
-    steps.forEach((step, idx) => {
-      const name   = (step.Name || step.name || step.apiName || `Step ${idx + 1}`).padEnd(40);
-      const status = (step.copado__Status__c || step.status || "UNKNOWN").toUpperCase();
-      const icon   = status.includes("SUCCESSFUL") || status.includes("SUCCESS") || status.includes("COMPLET") ? " OK "
-                   : status.includes("FAIL")        || status.includes("ERROR")                                ? "FAIL"
-                   : status.includes("SKIP")                                                                   ? "SKIP"
-                   : "....";
-      console.log(`    [${icon}] ${name} -> ${status}`);
+  console.log(`  OVERALL STATUS   : ${job.status}`);
+  if (job.steps.length) {
+    console.log('  STEP BREAKDOWN (same order as the Copado UI):');
+    job.steps.forEach((step, i) => {
+      const name = String(step.Name || step.name || step.apiName || step.copado__Name__c || `Step ${i + 1}`).padEnd(40);
+      const st = String(step.copado__Status__c || step.status || 'UNKNOWN').toUpperCase();
+      const c = classify(st);
+      const icon = c === 'SUCCESS' ? ' OK ' : c === 'FAILED' ? 'FAIL' : st.includes('SKIP') ? 'SKIP' : '....';
+      console.log(`    [${icon}] ${name} -> ${st}`);
     });
   } else {
-    console.log("  (No step data returned for this execution yet.)");
+    console.log('  (No step data returned yet.)');
   }
-  console.log("--------------------------------------------------------------------\n");
-
-  return jobStatus;
+  line('-');
 }
 
-// ─── PART 1: HEADLESS DEPLOYMENT & AUTO-SNAPSHOT ENGINE ───────────────────────
-if (command === 'deploy') {
+// Polls Copado and prints ONLY when something changed, so the terminal mirrors the UI.
+function pollUntilDone(jobExecutionId) {
+  const deadline = Date.now() + MAX_POLL_MINUTES * 60 * 1000;
+  let lastSig = '';
+  let consecutiveErrors = 0;
 
-  console.log("\n====================================================================");
-  console.log("[copado-hx] INITIATING HEADLESS METADATA AUTOMATION ROUTINE");
-  console.log("====================================================================");
+  while (Date.now() < deadline) {
+    const job = fetchJob(jobExecutionId);
 
-  // Step 1: Bind workspace tracking context
-  console.log("\nStep 1: Aligning Agentia tracking workspace context...");
-  runShell("agentia cicd work set " + storyId);
-
-  // Step 2: Track code changes vs main
-  console.log("\nStep 2: Scanning local branch for metadata deltas...");
-  let changedFiles = [];
-  try {
-    const gitOutput = runShellCapture("git diff --name-only origin/main");
-    changedFiles = gitOutput.split('\n').filter(f => f.trim() !== '');
-  } catch (err) {
-    console.log("  Git diff trace unavailable. Proceeding with clean tracking array.");
-  }
-
-  // Step 3: Take Client-Side Safety Backup Snapshot from QA
-  if (changedFiles.length > 0) {
-    const backupPath = path.join(__dirname, '.rollback', storyId);
-    fs.mkdirSync(backupPath, { recursive: true });
-    console.log(`\nStep 3: Extracting snapshot baseline into .rollback/${storyId}...`);
-
-    changedFiles.forEach(function(filePath) {
-      if (filePath.includes('copado-hx.js') || filePath.includes('.env')) return;
-
-      try {
-        const tempProjectDir = path.join(__dirname, '.temp_sf_project_' + Math.random().toString(36).substring(7));
-        fs.mkdirSync(path.join(tempProjectDir, 'force-app'), { recursive: true });
-
-        if (fs.existsSync('sfdx-project.json')) {
-          fs.copyFileSync('sfdx-project.json', path.join(tempProjectDir, 'sfdx-project.json'));
-        }
-
-        execSync(`sf project retrieve start --source-dir "${filePath}" --target-org ${TARGET_ORG}`, {
-          cwd: tempProjectDir,
-          encoding: 'utf8',
-          stdio: 'pipe'
-        });
-
-        const pulledFilePath = path.join(tempProjectDir, filePath);
-        if (fs.existsSync(pulledFilePath)) {
-          const dest = path.join(backupPath, path.basename(filePath));
-          fs.mkdirSync(path.dirname(dest), { recursive: true });
-          fs.copyFileSync(pulledFilePath, dest);
-          console.log("  Pre-deployment snapshot stored: " + path.basename(filePath));
-        }
-        fs.rmSync(tempProjectDir, { recursive: true, force: true });
-      } catch (err) {
-        console.log("  Component not in QA yet. Skipping snapshot for: " + path.basename(filePath));
-      }
-    });
-  } else {
-    console.log("\nStep 3: No changed components detected. Skipping snapshot phase.");
-  }
-
-// Step 4: Submit user story for Promotion and Deployment
-// sf copado:work:submit is the correct command for CLI versions before v3.12
-// sf copado story submit is the alias introduced in CLI v3.12+
-// Both support: --promote --deploy --wait --json
-console.log("\nStep 4: Submitting User Story for Promotion and Deployment...");
-console.log("        Using --wait flag: CLI will block until the job completes.\n");
-
-let jobExecutionId = "";
-let promotionId    = "";
-let finalStatus    = "";
-
-// Try the new syntax first, fall back to legacy syntax automatically
-function runSubmit() {
-  const commands = [
-    "sf copado story submit --promote --deploy --wait --json",   // CLI v3.12+
-    "sf copado:work:submit --promote --deploy --wait --json"     // CLI pre-v3.12 (legacy)
-  ];
-
-  for (const cmd of commands) {
-    try {
-      console.log(`  Trying: ${cmd}`);
-      return runShellCapture(cmd);
-    } catch (err) {
-      const msg = err.message || "";
-      // Only fall through if the error is "not a sf command" (wrong CLI version)
-      // Any other error (auth, network, etc.) should stop execution
-      if (msg.includes("not a sf command") || msg.includes("is not a sf command")) {
-        console.log("  Command not found in this CLI version. Trying legacy syntax...");
-        continue;
-      }
-      throw err; // Real error: re-throw it
-    }
-  }
-  throw new Error("Neither sf copado story submit nor sf copado:work:submit is available. Run: sf plugins update");
-}
-
-let submitOutput = "";
-try {
-  submitOutput = runSubmit();
-  console.log("\n  CLI response received.");
-} catch (err) {
-  console.error("\nCritical Failure: story submit command failed.");
-  console.error(err.message);
-  process.exit(1);
-}
-
-// Parse the JSON response to extract IDs and status
-try {
-  const parsed   = JSON.parse(submitOutput);
-  jobExecutionId = parsed.jobExecutionId
-                || parsed.job_execution_id
-                || (parsed.jobExecution && parsed.jobExecution.id)
-                || (parsed.result && parsed.result.jobExecutionId)
-                || "";
-  promotionId    = parsed.promotionId
-                || parsed.promotion_id
-                || (parsed.promotion && parsed.promotion.id)
-                || (parsed.result && parsed.result.promotionId)
-                || "";
-  finalStatus    = (parsed.jobStatus || parsed.status || "").toUpperCase();
-} catch (_) {
-  // Not JSON: try plain text ID extraction as fallback
-  const jobMatch   = submitOutput.match(/job_execution_id=([a-zA-Z0-9]{15,18})/i)
-                  || submitOutput.match(/jobExecutionId[:\s]+([a-zA-Z0-9]{15,18})/i);
-  const promoMatch = submitOutput.match(/promotion_id=([a-zA-Z0-9]{15,18})/i)
-                  || submitOutput.match(/promotionId[:\s]+([a-zA-Z0-9]{15,18})/i);
-  if (jobMatch)   jobExecutionId = jobMatch[1];
-  if (promoMatch) promotionId    = promoMatch[1];
-}
-
-if (promotionId)    console.log(`  Promotion ID      : ${promotionId}`);
-if (jobExecutionId) console.log(`  Job Execution ID  : ${jobExecutionId}`);
-else                console.log("  WARNING: No Job Execution ID found in CLI output. Polling will use generic fallback.");
-
-  // Step 5: If --wait returned a terminal status, display it directly.
-  // If not (older CLI versions may not support --wait), fall back to polling.
-  const TERMINAL_STATES = ["SUCCESSFUL", "SUCCESS", "COMPLETED", "FAILED", "ERROR", "CANCELLED"];
-
-  if (finalStatus && TERMINAL_STATES.some(s => finalStatus.includes(s))) {
-    // --wait worked: status is already terminal
-    console.log("\nStep 5: Final status received directly from CLI (--wait mode).");
-    printPromotionStatus(jobExecutionId);
-
-    if (finalStatus.includes("FAIL") || finalStatus.includes("ERROR") || finalStatus.includes("CANCEL")) {
-      console.log("DEPLOYMENT FAILED OR CANCELLED. Review your validation constraints.");
+    if (job.error) {
+      consecutiveErrors++;
+      console.log(`  [poll] status query failed (${consecutiveErrors}/5): ${String(job.error).split('\n')[0]}`);
+      if (consecutiveErrors >= 5) return { state: 'UNKNOWN', job: null };
     } else {
-      console.log("DEPLOYMENT COMPLETED SUCCESSFULLY in QA environment!");
+      consecutiveErrors = 0;
+      const sig = job.status + '|' + job.steps.map(s => `${s.Name || s.name}:${s.copado__Status__c || s.status}`).join(',');
+      if (sig !== lastSig) {
+        console.log(`\n[${new Date().toLocaleTimeString()}] Status update`);
+        renderJob(jobExecutionId, job);
+        lastSig = sig;
+      }
+      const c = classify(job.status);
+      if (c !== 'RUNNING') return { state: c, job };
     }
+    sleep(POLL_INTERVAL_MS);
+  }
+  return { state: 'TIMEOUT', job: null };
+}
 
+// ─── submit (new syntax first, legacy fallback) ──────────────────────────────
+function submitStory() {
+  const cmds = [
+    'sf copado story submit --promote --deploy --json',   // CLI v3.12+
+    'sf copado:work:submit --promote --deploy --json'     // CLI < v3.12
+  ];
+  for (const cmd of cmds) {
+    console.log(`  Trying: ${cmd}`);
+    const r = capture(cmd);
+    if (r.ok) return r.out;
+    const msg = `${r.err}\n${r.out}`;
+    if (/is not a sf command|command .* not found/i.test(msg)) {
+      console.log('  Not available in this CLI version, trying legacy syntax...');
+      continue;
+    }
+    const parsed = tryJson(r.out);
+    throw new Error((parsed && (parsed.message || findKey(parsed, ['message']))) || msg.trim());
+  }
+  throw new Error('Neither "sf copado story submit" nor "sf copado:work:submit" exists. Run: sf plugins update');
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// DEPLOY
+// ═════════════════════════════════════════════════════════════════════════════
+if (command === 'deploy') {
+  line();
+  console.log('[copado-hx] HEADLESS PROMOTION + AUTO-SNAPSHOT');
+  line();
+
+  const rbDir      = path.join(__dirname, '.rollback', storyId);
+  const projectDir = path.join(rbDir, 'project');          // self-contained sfdx project holding the snapshot
+  const manifestFp = path.join(rbDir, 'manifest.json');
+
+  // Step 1 ── bind workspace
+  console.log('\nStep 1: Setting active user story context...');
+  try { run(`agentia cicd work set ${storyId}`); }
+  catch (e) { console.error('Critical: could not set work item context.'); process.exit(1); }
+
+  // Step 2 ── detect changed metadata
+  console.log('\nStep 2: Scanning branch for metadata changes vs origin/main...');
+  let changedFiles = [];
+  let d = capture('git diff --name-only --diff-filter=ACMR origin/main...HEAD');
+  if (!d.ok) d = capture('git diff --name-only --diff-filter=ACMR origin/main');
+  if (d.ok) {
+    changedFiles = d.out.split('\n').map(f => f.trim()).filter(f => f && f.replace(/\\/g, '/').includes('/main/default/'));
   } else {
-    // --wait not supported or status not yet terminal: fall back to polling loop
-    console.log("\nStep 5: --wait did not return a terminal status. Falling back to polling...\n");
-
-    let isRunning  = true;
-    let checkCount = 0;
-    const maxChecks = 60;
-
-    while (isRunning && checkCount < maxChecks) {
-      const polledStatus = printPromotionStatus(jobExecutionId);
-
-      if (polledStatus && TERMINAL_STATES.some(s => polledStatus.includes(s))) {
-        if (polledStatus.includes("FAIL") || polledStatus.includes("ERROR") || polledStatus.includes("CANCEL")) {
-          console.log("DEPLOYMENT FAILED OR CANCELLED. Review your validation constraints.");
-        } else {
-          console.log("DEPLOYMENT COMPLETED SUCCESSFULLY in QA environment!");
-        }
-        isRunning = false;
-        break;
-      }
-
-      console.log(`  [Tick ${checkCount + 1}/${maxChecks}] Still IN PROGRESS. Waiting 12s...\n`);
-      execSync("powershell -Command \"Start-Sleep -s 12\"");
-      checkCount++;
-    }
-
-    if (isRunning) {
-      console.log("\nPolling window closed before a terminal status was reached.");
-      if (jobExecutionId) {
-        console.log("Check the final status manually with:");
-        console.log(`  sf copado job status --jobid ${jobExecutionId} --json`);
-      }
-    }
+    console.log('  Git diff unavailable; continuing without snapshot.');
   }
 
-// ─── PART 2: EMERGENCY RECOVERY ROLLBACK ENGINE ───────────────────────────────
-} else if (command === 'undo') {
+  const components = [];
+  const seen = new Set();
+  changedFiles.forEach(f => {
+    const md = toMetadata(f);
+    if (md && !seen.has(`${md.type}:${md.name}`)) { seen.add(`${md.type}:${md.name}`); components.push(md); }
+  });
+  console.log(`  ${changedFiles.length} changed file(s) -> ${components.length} metadata component(s).`);
 
-  console.log("\n====================================================================");
-  console.log("[copado-hx] INITIATING AGENTIC SNAPSHOT ROLLBACK RECOVERY");
-  console.log("====================================================================");
+  // Step 3 ── snapshot what is CURRENTLY in the target org
+  const manifest = {
+    storyId, targetOrg: TARGET_ORG, createdAt: new Date().toISOString(),
+    snapshotted: [], createdNew: [], skipped: [],
+    promotionId: '', jobExecutionId: '', finalStatus: 'NOT_SUBMITTED'
+  };
 
-  const backupPath = path.join(__dirname, '.rollback', storyId);
+  if (components.length) {
+    console.log(`\nStep 3: Snapshotting current state of ${TARGET_ORG} into .rollback/${storyId}/ ...`);
+    fs.rmSync(rbDir, { recursive: true, force: true });
+    fs.mkdirSync(path.join(projectDir, 'force-app'), { recursive: true });
 
-  if (fs.existsSync(backupPath)) {
-    console.log(`\nStep 1: Extracting local baseline snapshots from .rollback/${storyId}`);
-    console.log(`Force-deploying historical manifests back into target sandbox [${TARGET_ORG}]...`);
-    try {
-      runShell(`sf project deploy start --source-dir "${backupPath}" --target-org ${TARGET_ORG}`);
-      console.log("\n====================================================================");
-      console.log("SUCCESS: TARGET SANDBOX ENVIRONMENT SUCCESSFULLY ROLLED BACK!");
-      console.log("====================================================================");
-    } catch (err) {
-      console.error("\nCritical Failure: Local snapshot deployment recovery failed.");
-      process.exit(1);
+    let apiVersion = '61.0';
+    try { apiVersion = JSON.parse(fs.readFileSync('sfdx-project.json', 'utf8')).sourceApiVersion || apiVersion; } catch (_) {}
+    const projJson = { packageDirectories: [{ path: 'force-app', default: true }], sourceApiVersion: apiVersion };
+    writeJson(path.join(projectDir, 'sfdx-project.json'), projJson);
+
+    for (const c of components) {
+      const key = `${c.type}:${c.name}`;
+      const tmp = fs.mkdtempSync(path.join(__dirname, '.tmp_sf_'));
+      try {
+        fs.mkdirSync(path.join(tmp, 'force-app'), { recursive: true });
+        writeJson(path.join(tmp, 'sfdx-project.json'), projJson);
+
+        const r = capture(`sf project retrieve start --metadata "${key}" --target-org ${TARGET_ORG} --json`, { cwd: tmp });
+        const got = fs.existsSync(path.join(tmp, 'force-app')) && fs.readdirSync(path.join(tmp, 'force-app')).length > 0;
+
+        if (r.ok && got) {
+          fs.cpSync(path.join(tmp, 'force-app'), path.join(projectDir, 'force-app'), { recursive: true });
+          manifest.snapshotted.push(c);
+          console.log(`  [saved] ${key}`);
+        } else if (!r.ok && /auth|expired|no authorization|invalid_grant/i.test(r.out + r.err)) {
+          console.error(`\nCritical: cannot reach org "${TARGET_ORG}" (auth problem). Aborting before deploying.`);
+          console.error(r.err || r.out);
+          process.exit(1);
+        } else {
+          manifest.createdNew.push(c);
+          console.log(`  [new in ${TARGET_ORG}] ${key}`);
+        }
+      } finally {
+        fs.rmSync(tmp, { recursive: true, force: true });
+      }
     }
+    writeJson(manifestFp, manifest);
   } else {
-    console.log(`\nExecution Stopped: No local backup snapshot found for work item: ${storyId}`);
-    console.log("Verify that a successful deployment script run completed before calling undo.");
+    console.log('\nStep 3: No mappable metadata changes. Skipping snapshot (undo will not be available).');
+  }
+
+  // Step 4 ── submit
+  console.log('\nStep 4: Submitting User Story for Promotion + Deployment...');
+  let submitOutput;
+  try { submitOutput = submitStory(); }
+  catch (e) {
+    console.error('\nCritical: story submit failed.\n' + e.message);
     process.exit(1);
   }
+
+  const parsed = tryJson(submitOutput);
+  let jobExecutionId = '', promotionId = '';
+  if (parsed) {
+    jobExecutionId = findKey(parsed, ['jobExecutionId', 'job_execution_id', 'jobExecutionID']) || '';
+    promotionId    = findKey(parsed, ['promotionId', 'promotion_id']) || '';
+  } else {
+    const jm = submitOutput.match(/job_?execution_?id[=:\s]+([a-zA-Z0-9]{15,18})/i);
+    const pm = submitOutput.match(/promotion_?id[=:\s]+([a-zA-Z0-9]{15,18})/i);
+    jobExecutionId = jm ? jm[1] : '';
+    promotionId    = pm ? pm[1] : '';
+  }
+
+  manifest.promotionId = promotionId;
+  manifest.jobExecutionId = jobExecutionId;
+  manifest.finalStatus = 'SUBMITTED';
+  if (components.length) writeJson(manifestFp, manifest);
+
+  console.log('');
+  if (promotionId) {
+    console.log(`  Promotion ID     : ${promotionId}`);
+    if (COPADO_UI_URL) console.log(`  Promotion in UI  : ${COPADO_UI_URL}/lightning/r/copado__Promotion__c/${promotionId}/view`);
+  }
+  if (jobExecutionId) {
+    console.log(`  Job Execution ID : ${jobExecutionId}`);
+    if (COPADO_UI_URL) console.log(`  Job in UI        : ${COPADO_UI_URL}/lightning/r/copado__JobExecution__c/${jobExecutionId}/view`);
+  }
+
+  if (!jobExecutionId) {
+    console.log('\nWARNING: No Job Execution ID in the CLI output, so live status cannot be mirrored.');
+    console.log('Raw CLI output:\n' + submitOutput);
+    console.log('Check the promotion in the Copado UI.');
+    process.exit(2);
+  }
+
+  // Step 5 ── mirror Copado UI status in the terminal until the job finishes
+  console.log('\nStep 5: Mirroring Copado job status (Ctrl+C is safe, the job keeps running in Copado)...');
+  const { state } = pollUntilDone(jobExecutionId);
+
+  manifest.finalStatus = state;
+  if (components.length) writeJson(manifestFp, manifest);
+
+  console.log('');
+  line();
+  if (state === 'SUCCESS') {
+    console.log(`DEPLOYMENT COMPLETED SUCCESSFULLY in ${TARGET_ORG}.`);
+    if (components.length) console.log(`Rollback available:  node copado-hx.js undo ${storyId}`);
+    line();
+  } else if (state === 'FAILED') {
+    console.log('DEPLOYMENT FAILED OR CANCELLED. Review the failing step above or in the Copado UI.');
+    if (components.length) console.log(`If the org was partially changed:  node copado-hx.js undo ${storyId}`);
+    line();
+    process.exit(1);
+  } else {
+    console.log(`Polling ended without a final status (${state}).`);
+    console.log(`Check manually:  sf copado job status --jobid ${jobExecutionId} --json`);
+    line();
+    process.exit(2);
+  }
+
+// ═════════════════════════════════════════════════════════════════════════════
+// UNDO
+// ═════════════════════════════════════════════════════════════════════════════
+} else if (command === 'undo') {
+  line();
+  console.log('[copado-hx] SNAPSHOT ROLLBACK');
+  line();
+
+  const rbDir      = path.join(__dirname, '.rollback', storyId);
+  const projectDir = path.join(rbDir, 'project');
+  const manifestFp = path.join(rbDir, 'manifest.json');
+
+  if (!fs.existsSync(manifestFp)) {
+    console.log(`\nStopped: no snapshot found for "${storyId}" (.rollback/${storyId}/manifest.json).`);
+    console.log('Run "deploy" first; a snapshot is taken automatically before each promotion.');
+    process.exit(1);
+  }
+
+  const manifest = JSON.parse(fs.readFileSync(manifestFp, 'utf8'));
+  const org = manifest.targetOrg || TARGET_ORG;
+  const deleteNew = flags.includes('--delete-new');
+
+  console.log(`\nSnapshot taken : ${manifest.createdAt}`);
+  console.log(`Target org     : ${org}`);
+  console.log(`Restore        : ${manifest.snapshotted.length} component(s)`);
+  console.log(`New in deploy  : ${manifest.createdNew.length} component(s) ${deleteNew ? '(WILL be deleted)' : '(kept; pass --delete-new to remove)'}`);
+
+  // 1) restore previous versions
+  if (manifest.snapshotted.length) {
+    console.log('\nStep 1: Re-deploying pre-deployment versions...');
+    try {
+      run(`sf project deploy start --source-dir force-app --target-org ${org}`, { cwd: projectDir });
+    } catch (e) {
+      console.error('\nCritical: restore deployment failed. Snapshot is untouched in ' + projectDir);
+      process.exit(1);
+    }
+  }
+
+  // 2) optionally remove components that did not exist before the deploy
+  if (deleteNew && manifest.createdNew.length) {
+    console.log('\nStep 2: Removing components that were newly created by the deployment...');
+    const destDir = path.join(rbDir, 'destructive');
+    fs.mkdirSync(destDir, { recursive: true });
+    const apiV = (JSON.parse(fs.readFileSync(path.join(projectDir, 'sfdx-project.json'), 'utf8')).sourceApiVersion) || '61.0';
+    const byType = {};
+    manifest.createdNew.forEach(c => { (byType[c.type] = byType[c.type] || []).push(c.name); });
+    const types = Object.keys(byType).map(t =>
+      `  <types>\n${byType[t].map(n => `    <members>${n}</members>`).join('\n')}\n    <name>${t}</name>\n  </types>`).join('\n');
+    fs.writeFileSync(path.join(destDir, 'destructiveChangesPost.xml'),
+      `<?xml version="1.0" encoding="UTF-8"?>\n<Package xmlns="http://soap.sforce.com/2006/04/metadata">\n${types}\n  <version>${apiV}</version>\n</Package>\n`);
+    fs.writeFileSync(path.join(destDir, 'package.xml'),
+      `<?xml version="1.0" encoding="UTF-8"?>\n<Package xmlns="http://soap.sforce.com/2006/04/metadata">\n  <version>${apiV}</version>\n</Package>\n`);
+    try {
+      run(`sf project deploy start --manifest package.xml --post-destructive-changes destructiveChangesPost.xml --target-org ${org}`, { cwd: destDir });
+    } catch (e) {
+      console.error('\nCritical: destructive rollback failed.');
+      process.exit(1);
+    }
+  }
+
+  manifest.rolledBackAt = new Date().toISOString();
+  writeJson(manifestFp, manifest);
+
+  line();
+  console.log(`SUCCESS: ${org} rolled back to its pre-deployment state.`);
+  line();
+  console.log('Note: the Copado promotion record still shows the original deploy. Add a note or');
+  console.log('a reverting promotion in Copado if your team needs the UI history to reflect the rollback.');
 
 } else {
   console.log(`\nUnknown command: "${command}". Use "deploy" or "undo".`);
