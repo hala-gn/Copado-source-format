@@ -17,6 +17,7 @@
 const { execSync } = require('child_process');
 const fs = require('fs');
 const path = require('path');
+const os = require('os');
 
 try { require('dotenv').config(); } catch (e) { /* dotenv optional */ }
 
@@ -93,6 +94,16 @@ function classify(status) {
   if (TERMINAL_FAIL.some(t => s.includes(t))) return 'FAILED';
   if (TERMINAL_OK.some(t => s.includes(t)))   return 'SUCCESS';
   return 'RUNNING';
+}
+
+// Windows/OneDrive/antivirus can briefly lock freshly written folders (EPERM/EBUSY).
+// Retry, and never let cleanup crash the run.
+function safeRm(target) {
+  try {
+    fs.rmSync(target, { recursive: true, force: true, maxRetries: 8, retryDelay: 250 });
+  } catch (e) {
+    console.log(`  (could not delete temp folder ${path.basename(target)}: ${e.code || e.message}; safe to remove later)`);
+  }
 }
 
 function writeJson(file, data) {
@@ -252,7 +263,7 @@ if (command === 'deploy') {
 
   if (components.length) {
     console.log(`\nStep 3: Snapshotting current state of ${TARGET_ORG} into .rollback/${storyId}/ ...`);
-    fs.rmSync(rbDir, { recursive: true, force: true });
+    safeRm(rbDir);
     fs.mkdirSync(path.join(projectDir, 'force-app'), { recursive: true });
 
     let apiVersion = '61.0';
@@ -262,7 +273,8 @@ if (command === 'deploy') {
 
     for (const c of components) {
       const key = `${c.type}:${c.name}`;
-      const tmp = fs.mkdtempSync(path.join(__dirname, '.tmp_sf_'));
+      // system temp dir: outside OneDrive, so no sync locks
+      const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'copado-hx-'));
       try {
         fs.mkdirSync(path.join(tmp, 'force-app'), { recursive: true });
         writeJson(path.join(tmp, 'sfdx-project.json'), projJson);
@@ -283,7 +295,7 @@ if (command === 'deploy') {
           console.log(`  [new in ${TARGET_ORG}] ${key}`);
         }
       } finally {
-        fs.rmSync(tmp, { recursive: true, force: true });
+        safeRm(tmp);
       }
     }
     writeJson(manifestFp, manifest);
