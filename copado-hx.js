@@ -1,8 +1,7 @@
-#!/usr/bin/env node
 
-const { execSync } = require("child_process");
 const fs = require("fs");
 const path = require("path");
+const { spawnSync } = require("child_process");
 
 try {
   require("dotenv").config();
@@ -12,370 +11,214 @@ const [, , command, storyId] = process.argv;
 
 const SOURCE_ORG = process.env.SOURCE_ORG || "dev1";
 const TARGET_ORG = process.env.TARGET_ORG || "qa";
+const PROMOTION_MANIFEST = process.env.PROMOTION_MANIFEST;
+const API_VERSION = process.env.SF_API_VERSION || "66.0";
 
 const ROOT = __dirname;
-const ROLLBACK_ROOT = path.join(ROOT, ".rollback");
-const TEMP_ROOT = path.join(ROOT, ".temp_sf_pull");
+const HISTORY = path.join(ROOT, ".rollback", storyId || "unknown");
 
-if (!command || !storyId) {
-  console.log("Usage:");
-  console.log("  node copado-hx.js deploy <UserStoryName>");
-  console.log("  node copado-hx.js undo <UserStoryName>");
-  process.exit(1);
+function fail(message) {
+  throw new Error(message);
 }
 
-// Prevent shell injection through user-provided arguments.
-if (!/^[A-Za-z0-9_-]+$/.test(storyId)) {
-  console.error("Invalid user story ID.");
-  process.exit(1);
-}
+function cli(program, args) {
+  console.log("\n>", program, ...args);
 
-function run(cmd) {
-  console.log("\n$ " + cmd);
-  execSync(cmd, {
-    cwd: ROOT,
-    stdio: "inherit",
-    encoding: "utf8"
-  });
-}
-
-function capture(cmd) {
-  console.log("\n$ " + cmd);
-
-  const output = execSync(cmd, {
+  const result = spawnSync(program, args, {
     cwd: ROOT,
     encoding: "utf8",
-    stdio: ["inherit", "pipe", "pipe"]
+    stdio: "inherit",
+    shell: false
   });
 
-  if (output) console.log(output);
-  return output;
-}
+  if (result.error) throw result.error;
 
-function copyDirContents(source, destination) {
-  if (!fs.existsSync(source)) return;
-
-  fs.mkdirSync(destination, { recursive: true });
-
-  for (const entry of fs.readdirSync(source, {
-    withFileTypes: true
-  })) {
-    const src = path.join(source, entry.name);
-    const dst = path.join(destination, entry.name);
-
-    if (entry.isDirectory()) {
-      copyDirContents(src, dst);
-    } else if (entry.isFile()) {
-      fs.mkdirSync(path.dirname(dst), { recursive: true });
-      fs.copyFileSync(src, dst);
-    }
+  if (result.status !== 0) {
+    fail(`${program} exited with status ${result.status}`);
   }
 }
 
-function walkFiles(directory) {
-  if (!fs.existsSync(directory)) return [];
-
-  let files = [];
-
-  for (const entry of fs.readdirSync(directory, {
-    withFileTypes: true
-  })) {
-    const fullPath = path.join(directory, entry.name);
-
-    if (entry.isDirectory()) {
-      files = files.concat(walkFiles(fullPath));
-    } else {
-      files.push(fullPath);
-    }
-  }
-
-  return files;
+function readJson(file) {
+  return JSON.parse(fs.readFileSync(file, "utf8"));
 }
 
-function getChangedFiles() {
-  const output = capture(
-    "git diff --name-only origin/main"
-  );
-
-  return [...new Set(
-    output.split(/\r?\n/).filter(Boolean)
-  )];
+function writeJson(file, value) {
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  fs.writeFileSync(file, JSON.stringify(value, null, 2));
 }
 
-function saveSnapshot(storyId, changedFiles) {
-  const storyRoot = path.join(ROLLBACK_ROOT, storyId);
-  const snapshotRoot = path.join(storyRoot, "snapshot");
-
-  // Never overwrite an existing rollback snapshot.
-  if (fs.existsSync(storyRoot)) {
-    throw new Error(
-      "A rollback record already exists for " + storyId +
-      ". Preserve it and investigate before retrying."
+function checkInputs() {
+  if (!["deploy", "undo"].includes(command) || !storyId) {
+    fail(
+      "Usage: node copado-hx.js deploy US-0000025\n" +
+      "       node copado-hx.js undo US-0000025"
     );
   }
 
-  fs.mkdirSync(snapshotRoot, { recursive: true });
+  if (!/^US-[A-Za-z0-9_-]+$/.test(storyId)) {
+    fail("Invalid user story ID.");
+  }
+}
+
+function latestRun() {
+  const runsRoot = path.join(HISTORY, "runs");
+
+  if (!fs.existsSync(runsRoot)) {
+    fail("No rollback history exists for " + storyId);
+  }
+
+  const runs = fs.readdirSync(runsRoot)
+    .filter(name =>
+      fs.existsSync(path.join(runsRoot, name, "record.json"))
+    )
+    .sort()
+    .reverse();
+
+  if (!runs.length) fail("No deployment snapshot found.");
+
+  return path.join(runsRoot, runs[0]);
+}
+
+function deploy() {
+  if (!PROMOTION_MANIFEST) {
+    fail(
+      "Set PROMOTION_MANIFEST to the package.xml containing " +
+      "the exact components in this promotion."
+    );
+  }
+
+  const manifest = path.resolve(ROOT, PROMOTION_MANIFEST);
+
+  if (!fs.existsSync(manifest)) {
+    fail("Promotion manifest not found: " + manifest);
+  }
+
+  const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+  const runDir = path.join(HISTORY, "runs", stamp);
+  const snapshotDir = path.join(runDir, "snapshot-mdapi");
+
+  fs.mkdirSync(snapshotDir, { recursive: true });
 
   const record = {
     storyId,
     sourceOrg: SOURCE_ORG,
     targetOrg: TARGET_ORG,
+    manifest,
     createdAt: new Date().toISOString(),
-    status: "SNAPSHOT_IN_PROGRESS",
-    changedFiles,
-    restoredFiles: [],
-    potentiallyNewFiles: [],
-    warnings: []
+    snapshotStatus: "STARTED",
+    promotionStatus: "NOT_STARTED",
+    rollbackStatus: "NOT_STARTED",
+    warning:
+      "The manifest must match the exact Copado promotion scope."
   };
 
-  fs.writeFileSync(
-    path.join(storyRoot, "deployment.json"),
-    JSON.stringify(record, null, 2)
+  writeJson(path.join(runDir, "record.json"), record);
+
+  // Save previous QA state before running the promotion.
+  console.log("\nStep 1: Snapshotting QA metadata");
+
+  cli("sf", [
+    "project", "retrieve", "start",
+    "--manifest", manifest,
+    "--target-org", TARGET_ORG,
+    "--target-metadata-dir", snapshotDir,
+    "--unzip",
+    "--api-version", API_VERSION,
+    "--wait", "30"
+  ]);
+
+  const snapshotPackage = path.join(snapshotDir, "package.xml");
+
+  if (!fs.existsSync(snapshotPackage)) {
+    fail("Snapshot package.xml is missing. Promotion cancelled.");
+  }
+
+  record.snapshotStatus = "COMPLETE";
+  writeJson(path.join(runDir, "record.json"), record);
+
+  // Run the existing Agentia workflow.
+  // Promotion discovery/execution must match your installed CLI.
+  console.log("\nStep 2: Setting Agentia work item");
+
+  cli("agentia", ["cicd", "work", "set", storyId]);
+
+  console.log("\nStep 3: Running Agentia work done");
+
+  record.promotionStatus = "COMMAND_STARTED";
+  writeJson(path.join(runDir, "record.json"), record);
+
+  cli("agentia", ["cicd", "work", "done"]);
+
+  record.promotionStatus = "COMMAND_COMPLETED_UNVERIFIED";
+  record.completedAt = new Date().toISOString();
+  writeJson(path.join(runDir, "record.json"), record);
+
+  console.log("\nAgentia command completed.");
+  console.log("Verify the promotion result in Copado.");
+  console.log("Snapshot: " + snapshotDir);
+}
+
+function undo() {
+  const runDir = latestRun();
+  const recordFile = path.join(runDir, "record.json");
+  const record = readJson(recordFile);
+  const snapshotDir = path.join(runDir, "snapshot-mdapi");
+
+  if (record.targetOrg !== TARGET_ORG) {
+    fail("Target org does not match the saved snapshot.");
+  }
+
+  if (record.snapshotStatus !== "COMPLETE") {
+    fail("Snapshot was not completed. Cannot safely undo.");
+  }
+
+  if (record.rollbackStatus === "COMPLETED") {
+    fail("This run has already been rolled back.");
+  }
+
+  if (!fs.existsSync(path.join(snapshotDir, "package.xml"))) {
+    fail("Snapshot package.xml is missing.");
+  }
+
+  console.log("\nRestoring saved metadata to QA.");
+
+  console.log(
+    "Only metadata included in the snapshot is restored. " +
+    "New components require a verified destructive manifest."
   );
 
+  record.rollbackStatus = "STARTED";
+  writeJson(recordFile, record);
+
   try {
-    for (const file of changedFiles) {
-      const absoluteFile = path.resolve(ROOT, file);
+    cli("sf", [
+      "project", "deploy", "start",
+      "--metadata-dir", snapshotDir,
+      "--target-org", TARGET_ORG,
+      "--wait", "30",
+      "--api-version", API_VERSION
+    ]);
 
-      // Only snapshot files belonging to the local project.
-      if (
-        !absoluteFile.startsWith(ROOT + path.sep) ||
-        !fs.existsSync(absoluteFile) ||
-        !fs.statSync(absoluteFile).isFile()
-      ) {
-        record.warnings.push(
-          "Skipped invalid or missing local file: " + file
-        );
-        continue;
-      }
+    record.rollbackStatus = "COMPLETED";
+    record.rollbackCompletedAt = new Date().toISOString();
+    writeJson(recordFile, record);
 
-      const tempDir = path.join(
-        TEMP_ROOT,
-        Buffer.from(file).toString("hex")
-      );
-
-      fs.rmSync(tempDir, { recursive: true, force: true });
-      fs.mkdirSync(tempDir, { recursive: true });
-
-      try {
-        // Retrieve the previous version from QA.
-        run(
-          "sf project retrieve start --source-dir " +
-          JSON.stringify(file) +
-          " --target-org " + TARGET_ORG +
-          " --output-dir " + JSON.stringify(tempDir)
-        );
-
-        const candidates = walkFiles(tempDir);
-        const filename = path.basename(file);
-
-        const matchingFiles = candidates.filter(
-          candidate => path.basename(candidate) === filename
-        );
-
-        if (matchingFiles.length === 0) {
-          record.potentiallyNewFiles.push(file);
-          console.log(
-            "⚠️ No matching snapshot file found for: " + file
-          );
-          continue;
-        }
-
-        for (const retrievedFile of matchingFiles) {
-          const destination = path.join(
-            snapshotRoot,
-            path.relative(tempDir, retrievedFile)
-          );
-
-          fs.mkdirSync(path.dirname(destination), {
-            recursive: true
-          });
-
-          fs.copyFileSync(retrievedFile, destination);
-          record.restoredFiles.push(
-            path.relative(storyRoot, destination)
-          );
-
-          console.log("📸 Snapshot saved: " + file);
-        }
-      } finally {
-        fs.rmSync(tempDir, {
-          recursive: true,
-          force: true
-        });
-      }
-    }
-
-    if (record.potentiallyNewFiles.length > 0) {
-      record.warnings.push(
-        "Some files could not be snapshotted. " +
-        "Verify whether they are new components before rollback."
-      );
-    }
-
-    record.status = "SNAPSHOT_COMPLETE";
-
-    fs.writeFileSync(
-      path.join(storyRoot, "deployment.json"),
-      JSON.stringify(record, null, 2)
-    );
-
-    return record;
+    console.log("\nMetadata restoration deployment succeeded.");
+    console.log("Verify the resulting state in QA.");
   } catch (error) {
-    record.status = "SNAPSHOT_FAILED";
-    record.error = error.message;
-
-    fs.writeFileSync(
-      path.join(storyRoot, "deployment.json"),
-      JSON.stringify(record, null, 2)
-    );
-
+    record.rollbackStatus = "FAILED";
+    record.rollbackError = error.message;
+    writeJson(recordFile, record);
     throw error;
   }
 }
 
-// ---------------- DEPLOY ----------------
+try {
+  checkInputs();
 
-if (command === "deploy") {
-  console.log("\n🚀 Starting deployment: " + storyId);
-
-  try {
-    console.log("\n📌 Step 1: Setting work item context");
-    run("agentia cicd work set " + storyId);
-
-    console.log("\n🔍 Step 2: Finding changed files");
-    const changedFiles = getChangedFiles();
-
-    if (changedFiles.length === 0) {
-      throw new Error(
-        "No changed files found against origin/main. " +
-        "Check your branch and Git diff before deploying."
-      );
-    }
-
-    console.log("\nChanged files:");
-    changedFiles.forEach(file => console.log(" - " + file));
-
-    console.log("\n📸 Step 3: Saving QA snapshot");
-    const record = saveSnapshot(storyId, changedFiles);
-
-    if (record.status !== "SNAPSHOT_COMPLETE") {
-      throw new Error("QA snapshot was not completed.");
-    }
-
-    console.log("\n🚀 Step 4: Preparing Agentia promotion");
-
-    // Capture the output because it may contain the promotion ID.
-    const workOutput = capture(
-      "agentia cicd work done"
-    );
-
-    const promotionMatch = workOutput.match(
-      /\bpromotion_id\s*=\s*([A-Za-z0-9]{18})\b/i
-    );
-
-    const promotionId =
-      process.env.PROMOTION_ID ||
-      (promotionMatch && promotionMatch[1]);
-
-    if (
-      !promotionId ||
-      !/^[A-Za-z0-9]{18}$/.test(promotionId)
-    ) {
-      throw new Error(
-        "Could not find the 18-character promotion ID. " +
-        "Check the work done output and set PROMOTION_ID " +
-        "to the correct promotion ID if needed."
-      );
-    }
-
-    console.log("\nPromotion ID: " + promotionId);
-
-    // Use the required positional promotion ID.
-    const promotionOutput = capture(
-      "agentia cicd promotion run " + promotionId
-    );
-
-    record.promotionId = promotionId;
-    record.promotionOutput = promotionOutput;
-    record.status = "PROMOTION_COMMAND_COMPLETED";
-    record.completedAt = new Date().toISOString();
-
-    fs.writeFileSync(
-      path.join(ROLLBACK_ROOT, storyId, "deployment.json"),
-      JSON.stringify(record, null, 2)
-    );
-
-    console.log("\n✅ Promotion command completed.");
-    console.log("Verify the actual deployment result in Copado.");
-    console.log("Rollback record: .rollback/" + storyId);
-  } catch (error) {
-    console.error("\n❌ Deployment workflow failed.");
-    console.error(error.message);
-    console.error(
-      "Check Copado before retrying; the promotion may " +
-      "already have executed."
-    );
-    process.exit(1);
-  }
-}
-
-// ---------------- UNDO ----------------
-
-else if (command === "undo") {
-  console.log("\n🔄 Starting rollback for: " + storyId);
-
-  const storyRoot = path.join(ROLLBACK_ROOT, storyId);
-  const recordPath = path.join(storyRoot, "deployment.json");
-  const snapshotRoot = path.join(storyRoot, "snapshot");
-
-  if (!fs.existsSync(recordPath)) {
-    console.error("❌ No deployment record found for " + storyId);
-    process.exit(1);
-  }
-
-  const record = JSON.parse(
-    fs.readFileSync(recordPath, "utf8")
-  );
-
-  if (
-    record.targetOrg !== TARGET_ORG ||
-    !fs.existsSync(snapshotRoot)
-  ) {
-    console.error("❌ Snapshot or target org does not match.");
-    process.exit(1);
-  }
-
-  if (
-    !record.restoredFiles ||
-    record.restoredFiles.length === 0
-  ) {
-    console.error("❌ No verified snapshot files to restore.");
-    process.exit(1);
-  }
-
-  console.log(
-    "\n⚠️ This restores saved files only. It does not yet " +
-    "delete components created by the original deployment."
-  );
-
-  console.log(
-    "Review the snapshot directory before proceeding: " +
-    snapshotRoot
-  );
-
-  console.log(
-    "\nDo not run the restore until you have confirmed " +
-    "the snapshot has valid Salesforce package structure."
-  );
-
-  console.log(
-    "\nNext step: build a manifest-based restore using the " +
-    "recorded metadata types and destructive changes."
-  );
-}
-
-else {
-  console.error("Unknown command: " + command);
-  process.exit(1);
+  if (command === "deploy") deploy();
+  else undo();
+} catch (error) {
+  console.error("\nERROR:", error.message);
+  process.exitCode = 1;
 }
