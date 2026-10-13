@@ -4,7 +4,6 @@ const { execSync } = require('child_process');
 const fs = require('fs');
 const path = require('path');
 
-// Safe validation framework: skip gracefully if dotenv is missing in the hackathon workspace
 try { require('dotenv').config(); } catch (e) {}
 
 const [,, command, storyId] = process.argv;
@@ -31,51 +30,54 @@ function runShellCapture(cmd) {
 }
 
 // ─── PROMOTION STATUS DISPLAY HELPER ──────────────────────────────────────────
-// Uses the official Copado CLI command: sf copado job status -i <jobExecutionId> --json
-// This returns the same jobStatus + per-step statuses shown in the Copado UI.
+// Official Copado CLI command per docs: sf copado job status --jobid <id> --json
+// Official response fields: jobStatus (string), steps (array of JobStep__c)
 function printPromotionStatus(jobExecutionId) {
   if (!jobExecutionId) {
     console.log("  [Status] No Job Execution ID captured. Cannot query precise status.");
     return null;
   }
 
-  let statusObj = null;
+  let parsed = null;
   try {
-    const rawJson = runShellCapture(`sf copado job status -i ${jobExecutionId} --json`);
-    statusObj = JSON.parse(rawJson);
+    // --jobid is the correct flag name per Copado CLI docs
+    const rawJson = runShellCapture(`sf copado job status --jobid ${jobExecutionId} --json`);
+    parsed = JSON.parse(rawJson);
   } catch (err) {
-    console.log("  [Status] Could not retrieve job status via Copado CLI:", err.message);
+    console.log("  [Status] CLI query failed:", err.message);
     return null;
   }
 
-  const jobStatus = (statusObj.jobStatus || statusObj.status || "UNKNOWN").toUpperCase();
-  const steps     = Array.isArray(statusObj.steps) ? statusObj.steps : [];
+  // Copado returns "jobStatus" at the top level per the Jobs Domain docs
+  const jobStatus = (parsed.jobStatus || parsed.status || "UNKNOWN").toUpperCase();
+  const steps     = Array.isArray(parsed.steps) ? parsed.steps : [];
 
-  console.log("\n--------------------------------------------------------------------");
+  console.log("--------------------------------------------------------------------");
   console.log(`  JOB EXECUTION ID : ${jobExecutionId}`);
   console.log(`  OVERALL STATUS   : ${jobStatus}`);
 
   if (steps.length > 0) {
-    console.log("  STEP-BY-STEP BREAKDOWN (mirrors Copado UI):");
+    console.log("  STEP BREAKDOWN (mirrors Copado UI):");
     steps.forEach((step, idx) => {
-      const stepName   = step.name || step.apiName || `Step ${idx + 1}`;
-      const stepStatus = (step.status || "UNKNOWN").toUpperCase();
-      const stepIcon   = stepStatus.includes("SUCCESS") || stepStatus.includes("COMPLET") ? "OK"
-                       : stepStatus.includes("FAIL")    || stepStatus.includes("ERROR")   ? "FAIL"
-                       : stepStatus.includes("SKIP")                                       ? "SKIP"
-                       : "....";
-      console.log(`    [${stepIcon}] ${stepName.padEnd(40)} -> ${stepStatus}`);
+      const name   = (step.Name || step.name || step.apiName || `Step ${idx + 1}`).padEnd(40);
+      const status = (step.copado__Status__c || step.status || "UNKNOWN").toUpperCase();
+      const icon   = status.includes("SUCCESSFUL") || status.includes("SUCCESS") || status.includes("COMPLET") ? " OK "
+                   : status.includes("FAIL")        || status.includes("ERROR")                                ? "FAIL"
+                   : status.includes("SKIP")                                                                   ? "SKIP"
+                   : "....";
+      console.log(`    [${icon}] ${name} -> ${status}`);
     });
   } else {
-    console.log("  (No individual step data returned by the CLI for this execution.)");
+    console.log("  (No step data returned for this execution yet.)");
   }
   console.log("--------------------------------------------------------------------\n");
 
   return jobStatus;
 }
 
-// ─── PART 1: THE HEADLESS DEPLOYMENT & AUTO-SNAPSHOT ENGINE ───────────────────
+// ─── PART 1: HEADLESS DEPLOYMENT & AUTO-SNAPSHOT ENGINE ───────────────────────
 if (command === 'deploy') {
+
   console.log("\n====================================================================");
   console.log("[copado-hx] INITIATING HEADLESS METADATA AUTOMATION ROUTINE");
   console.log("====================================================================");
@@ -85,7 +87,7 @@ if (command === 'deploy') {
   runShell("agentia cicd work set " + storyId);
 
   // Step 2: Track code changes vs main
-  console.log("\nStep 2: Scanning local branch for tracking metadata deltas...");
+  console.log("\nStep 2: Scanning local branch for metadata deltas...");
   let changedFiles = [];
   try {
     const gitOutput = runShellCapture("git diff --name-only origin/main");
@@ -98,7 +100,7 @@ if (command === 'deploy') {
   if (changedFiles.length > 0) {
     const backupPath = path.join(__dirname, '.rollback', storyId);
     fs.mkdirSync(backupPath, { recursive: true });
-    console.log(`\nStep 3: Extracting snapshot tracking baseline into .rollback/${storyId}...`);
+    console.log(`\nStep 3: Extracting snapshot baseline into .rollback/${storyId}...`);
 
     changedFiles.forEach(function(filePath) {
       if (filePath.includes('copado-hx.js') || filePath.includes('.env')) return;
@@ -126,136 +128,113 @@ if (command === 'deploy') {
         }
         fs.rmSync(tempProjectDir, { recursive: true, force: true });
       } catch (err) {
-        console.log("  Component doesn't exist in QA yet. Skipping snapshot for: " + path.basename(filePath));
+        console.log("  Component not in QA yet. Skipping snapshot for: " + path.basename(filePath));
       }
     });
   } else {
     console.log("\nStep 3: No changed components detected. Skipping snapshot phase.");
   }
 
-  // Step 4: Run 'work done' to finalize user story and initiate cloud deployment
-console.log("\nStep 4: Finalizing User Story state and initiating Promotion...");
-let promotionId    = "";
-let jobExecutionId = "";
+  // Step 4: Submit user story with --wait so the CLI blocks until the job finishes.
+  // This is the most reliable approach per Copado docs: no manual polling needed.
+  // sf copado story submit --promote --deploy --wait --json
+  console.log("\nStep 4: Submitting User Story for Promotion and Deployment...");
+  console.log("        Using --wait flag: CLI will block until the job completes.");
+  console.log("        Status updates will appear below in real time.\n");
 
-try {
-  const outputLog = runShellCapture("agentia cicd work done");
-  console.log(outputLog);
+  let jobExecutionId = "";
+  let promotionId    = "";
+  let finalStatus    = "";
 
-  // Extract IDs from plain text output
-  const promoMatch = outputLog.match(/promotion_id=([a-zA-Z0-9]{15,18})/i);
-  if (promoMatch && promoMatch[1]) promotionId = promoMatch[1];
+  try {
+    const submitOutput = runShellCapture("sf copado story submit --promote --deploy --wait --json");
+    console.log("\n  Raw CLI response received.");
 
-  const jobMatch = outputLog.match(/job_execution_id=([a-zA-Z0-9]{15,18})/i);
-  if (jobMatch && jobMatch[1]) jobExecutionId = jobMatch[1];
-
-  // Fallback: try parsing as JSON
-  if (!jobExecutionId) {
     try {
-      const parsed = JSON.parse(outputLog);
+      const parsed   = JSON.parse(submitOutput);
       jobExecutionId = parsed.jobExecutionId
                     || parsed.job_execution_id
                     || (parsed.jobExecution && parsed.jobExecution.id)
+                    || (parsed.result && parsed.result.jobExecutionId)
                     || "";
-      promotionId    = promotionId
-                    || parsed.promotionId
+      promotionId    = parsed.promotionId
                     || parsed.promotion_id
                     || (parsed.promotion && parsed.promotion.id)
+                    || (parsed.result && parsed.result.promotionId)
                     || "";
-    } catch (_) {}
-  }
-} catch (err) {
-  console.error("Critical Failure during work serialization milestone execution.");
-  process.exit(1);
-}
-
-if (promotionId)    console.log(`  Promotion ID      : ${promotionId}`);
-if (jobExecutionId) console.log(`  Job Execution ID  : ${jobExecutionId}`);
-
-// Step 5: Poll using the correct Copado CLI command with correct field names
-// Official command: sf copado:job:status -i <jobId> --json
-// Official JSON response field: jobStatus (not "status")
-// Terminal values per Copado docs: Successful, Failed, Cancelled
-console.log("\nStep 5: Polling promotion status via sf copado:job:status...");
-console.log("        Mirrors the exact status shown in the Copado UI.\n");
-
-const TERMINAL_STATES = ["SUCCESSFUL", "SUCCESS", "COMPLETED", "FAILED", "ERROR", "CANCELLED", "CONFLICT"];
-let isRunning  = true;
-let checkCount = 0;
-const maxChecks = 60;
-
-while (isRunning && checkCount < maxChecks) {
-  let jobStatus = null;
-
-  if (jobExecutionId) {
-    try {
-      // Use the documented colon-syntax command and documented field name
-      const rawJson  = runShellCapture(`sf copado:job:status -i ${jobExecutionId} --json`);
-      const parsed   = JSON.parse(rawJson);
-
-      // Copado returns "jobStatus" at the top level, with a "steps" array
-      jobStatus      = (parsed.jobStatus || parsed.status || "IN PROGRESS").toUpperCase();
-      const steps    = Array.isArray(parsed.steps) ? parsed.steps : [];
-
-      console.log("--------------------------------------------------------------------");
-      console.log(`  JOB EXECUTION ID : ${jobExecutionId}`);
-      console.log(`  OVERALL STATUS   : ${jobStatus}`);
-
-      if (steps.length > 0) {
-        console.log("  STEP BREAKDOWN:");
-        steps.forEach((step, idx) => {
-          const name   = (step.name || step.apiName || `Step ${idx + 1}`).padEnd(40);
-          const status = (step.status || "UNKNOWN").toUpperCase();
-          const icon   = status.includes("SUCCESS") || status.includes("COMPLET") ? " OK "
-                       : status.includes("FAIL")    || status.includes("ERROR")   ? "FAIL"
-                       : status.includes("SKIP")                                   ? "SKIP"
-                       : "....";
-          console.log(`    [${icon}] ${name} -> ${status}`);
-        });
-      }
-      console.log("--------------------------------------------------------------------\n");
-
-    } catch (err) {
-      console.log(`  [Tick ${checkCount + 1}] Could not query job status: ${err.message}`);
-      console.log("  Retrying in 12s...\n");
+      finalStatus    = (parsed.jobStatus || parsed.status || "").toUpperCase();
+    } catch (_) {
+      // Not JSON: try plain text ID extraction as fallback
+      const jobMatch   = submitOutput.match(/job_execution_id=([a-zA-Z0-9]{15,18})/i)
+                      || submitOutput.match(/jobExecutionId[:\s]+([a-zA-Z0-9]{15,18})/i);
+      const promoMatch = submitOutput.match(/promotion_id=([a-zA-Z0-9]{15,18})/i)
+                      || submitOutput.match(/promotionId[:\s]+([a-zA-Z0-9]{15,18})/i);
+      if (jobMatch)   jobExecutionId = jobMatch[1];
+      if (promoMatch) promotionId    = promoMatch[1];
     }
-  } else {
-    // No jobExecutionId captured: fall back to generic work status
-    try {
-      const fallback = runShellCapture("agentia cicd work status");
-      console.log("  [Fallback - no Job Execution ID] Generic work status:");
-      console.log("  " + fallback.split('\n')[0]);
-      jobStatus = fallback.toUpperCase();
-    } catch (_) {}
+
+    if (promotionId)    console.log(`  Promotion ID      : ${promotionId}`);
+    if (jobExecutionId) console.log(`  Job Execution ID  : ${jobExecutionId}`);
+
+  } catch (err) {
+    console.error("\nCritical Failure: story submit command failed.");
+    console.error(err.message);
+    process.exit(1);
   }
 
-  // Check for terminal states
-  if (jobStatus && TERMINAL_STATES.some(s => jobStatus.includes(s))) {
-    if (jobStatus.includes("FAIL") || jobStatus.includes("ERROR") || jobStatus.includes("CANCEL") || jobStatus.includes("CONFLICT")) {
-      console.log("DEPLOYMENT FAILED OR CANCELLED. Review your validation constraints in the Copado UI.");
+  // Step 5: If --wait returned a terminal status, display it directly.
+  // If not (older CLI versions may not support --wait), fall back to polling.
+  const TERMINAL_STATES = ["SUCCESSFUL", "SUCCESS", "COMPLETED", "FAILED", "ERROR", "CANCELLED"];
+
+  if (finalStatus && TERMINAL_STATES.some(s => finalStatus.includes(s))) {
+    // --wait worked: status is already terminal
+    console.log("\nStep 5: Final status received directly from CLI (--wait mode).");
+    printPromotionStatus(jobExecutionId);
+
+    if (finalStatus.includes("FAIL") || finalStatus.includes("ERROR") || finalStatus.includes("CANCEL")) {
+      console.log("DEPLOYMENT FAILED OR CANCELLED. Review your validation constraints.");
     } else {
       console.log("DEPLOYMENT COMPLETED SUCCESSFULLY in QA environment!");
     }
-    isRunning = false;
-    break;
+
+  } else {
+    // --wait not supported or status not yet terminal: fall back to polling loop
+    console.log("\nStep 5: --wait did not return a terminal status. Falling back to polling...\n");
+
+    let isRunning  = true;
+    let checkCount = 0;
+    const maxChecks = 60;
+
+    while (isRunning && checkCount < maxChecks) {
+      const polledStatus = printPromotionStatus(jobExecutionId);
+
+      if (polledStatus && TERMINAL_STATES.some(s => polledStatus.includes(s))) {
+        if (polledStatus.includes("FAIL") || polledStatus.includes("ERROR") || polledStatus.includes("CANCEL")) {
+          console.log("DEPLOYMENT FAILED OR CANCELLED. Review your validation constraints.");
+        } else {
+          console.log("DEPLOYMENT COMPLETED SUCCESSFULLY in QA environment!");
+        }
+        isRunning = false;
+        break;
+      }
+
+      console.log(`  [Tick ${checkCount + 1}/${maxChecks}] Still IN PROGRESS. Waiting 12s...\n`);
+      execSync("powershell -Command \"Start-Sleep -s 12\"");
+      checkCount++;
+    }
+
+    if (isRunning) {
+      console.log("\nPolling window closed before a terminal status was reached.");
+      if (jobExecutionId) {
+        console.log("Check the final status manually with:");
+        console.log(`  sf copado job status --jobid ${jobExecutionId} --json`);
+      }
+    }
   }
 
-  console.log(`  [Tick ${checkCount + 1}/${maxChecks}] Status still IN PROGRESS. Waiting 12s...\n`);
-  execSync("powershell -Command \"Start-Sleep -s 12\"");
-  checkCount++;
-}
+// ─── PART 2: EMERGENCY RECOVERY ROLLBACK ENGINE ───────────────────────────────
+} else if (command === 'undo') {
 
-if (isRunning) {
-  console.log("\nPolling window closed before a terminal status was reached.");
-  if (jobExecutionId) {
-    console.log("Run this command manually to check the final status:");
-    console.log(`  sf copado:job:status -i ${jobExecutionId} --json`);
-  }
-  console.log("Or open the Promotion record in the Copado UI.");
-}
-
-// ─── PART 2: THE EMERGENCY RECOVERY ROLLBACK ENGINE ───────────────────────────
-else if (command === 'undo') {
   console.log("\n====================================================================");
   console.log("[copado-hx] INITIATING AGENTIC SNAPSHOT ROLLBACK RECOVERY");
   console.log("====================================================================");
@@ -279,4 +258,8 @@ else if (command === 'undo') {
     console.log("Verify that a successful deployment script run completed before calling undo.");
     process.exit(1);
   }
+
+} else {
+  console.log(`\nUnknown command: "${command}". Use "deploy" or "undo".`);
+  process.exit(1);
 }
