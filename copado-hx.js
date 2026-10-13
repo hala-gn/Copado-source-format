@@ -203,8 +203,11 @@ function submitStory() {
   const cmds = process.env.COPADO_SUBMIT_CMD
     ? [process.env.COPADO_SUBMIT_CMD]
     : [
-        'sf copado story submit --promote --deploy --json',   // CLI v3.12+
-        'sf copado:work:submit --promote --deploy --json'     // CLI < v3.12
+        'agentia cicd work submit --promote --deploy --json', // same CLI family as `agentia cicd work set`
+        'agentia cicd work submit --promote --deploy',        // if --json is not supported
+        'agentia cicd work submit',                           // if the flags are not supported
+        'sf copado story submit --promote --deploy --json',   // Copado sf plugin v3.12+
+        'sf copado:work:submit --promote --deploy --json'     // Copado sf plugin < v3.12
       ];
   const errors = [];
   for (const cmd of cmds) {
@@ -217,7 +220,7 @@ function submitStory() {
     console.log('  ----------------');
     errors.push(`${cmd}\n${msg}`);
     // keep trying the next syntax only when the command itself is unknown
-    if (!/is not a sf command|not a valid command|command .* not found|Unknown command/i.test(msg)) break;
+    if (!/is not a sf command|not a valid command|command .* not found|Unknown command|nonexistent flag|unknown (option|argument|flag)|unexpected argument|unrecognized/i.test(msg)) break;
   }
   throw new Error(
     'Story submit failed. Run these in your terminal to find the right command, then set COPADO_SUBMIT_CMD in .env:\n' +
@@ -318,6 +321,11 @@ if (command === 'deploy') {
     process.exit(1);
   }
 
+  // Always show what the CLI printed (the old script swallowed this, so nothing appeared in VS Code).
+  console.log('\n  --- CLI output ---');
+  console.log('  ' + (submitOutput || '(empty)').split('\n').join('\n  '));
+  console.log('  ------------------');
+
   const parsed = tryJson(submitOutput);
   let jobExecutionId = '', promotionId = '';
   if (parsed) {
@@ -346,9 +354,9 @@ if (command === 'deploy') {
   }
 
   if (!jobExecutionId) {
-    console.log('\nWARNING: No Job Execution ID in the CLI output, so live status cannot be mirrored.');
-    console.log('Raw CLI output:\n' + submitOutput);
-    console.log('Check the promotion in the Copado UI.');
+    console.log('\nWARNING: No Job Execution ID found in the CLI output above, so live polling is not possible.');
+    console.log('The promotion was submitted; check it in the Copado UI. Paste the CLI output above to me');
+    console.log('and I will map the right fields (or the right status command) for it.');
     process.exit(2);
   }
 
