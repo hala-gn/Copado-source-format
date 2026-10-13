@@ -135,52 +135,79 @@ if (command === 'deploy') {
     console.log("\nStep 3: No changed components detected. Skipping snapshot phase.");
   }
 
-  // Step 4: Submit user story with --wait so the CLI blocks until the job finishes.
-  // This is the most reliable approach per Copado docs: no manual polling needed.
-  // sf copado story submit --promote --deploy --wait --json
-  console.log("\nStep 4: Submitting User Story for Promotion and Deployment...");
-  console.log("        Using --wait flag: CLI will block until the job completes.");
-  console.log("        Status updates will appear below in real time.\n");
+// Step 4: Submit user story for Promotion and Deployment
+// sf copado:work:submit is the correct command for CLI versions before v3.12
+// sf copado story submit is the alias introduced in CLI v3.12+
+// Both support: --promote --deploy --wait --json
+console.log("\nStep 4: Submitting User Story for Promotion and Deployment...");
+console.log("        Using --wait flag: CLI will block until the job completes.\n");
 
-  let jobExecutionId = "";
-  let promotionId    = "";
-  let finalStatus    = "";
+let jobExecutionId = "";
+let promotionId    = "";
+let finalStatus    = "";
 
-  try {
-    const submitOutput = runShellCapture("sf copado story submit --promote --deploy --wait --json");
-    console.log("\n  Raw CLI response received.");
+// Try the new syntax first, fall back to legacy syntax automatically
+function runSubmit() {
+  const commands = [
+    "sf copado story submit --promote --deploy --wait --json",   // CLI v3.12+
+    "sf copado:work:submit --promote --deploy --wait --json"     // CLI pre-v3.12 (legacy)
+  ];
 
+  for (const cmd of commands) {
     try {
-      const parsed   = JSON.parse(submitOutput);
-      jobExecutionId = parsed.jobExecutionId
-                    || parsed.job_execution_id
-                    || (parsed.jobExecution && parsed.jobExecution.id)
-                    || (parsed.result && parsed.result.jobExecutionId)
-                    || "";
-      promotionId    = parsed.promotionId
-                    || parsed.promotion_id
-                    || (parsed.promotion && parsed.promotion.id)
-                    || (parsed.result && parsed.result.promotionId)
-                    || "";
-      finalStatus    = (parsed.jobStatus || parsed.status || "").toUpperCase();
-    } catch (_) {
-      // Not JSON: try plain text ID extraction as fallback
-      const jobMatch   = submitOutput.match(/job_execution_id=([a-zA-Z0-9]{15,18})/i)
-                      || submitOutput.match(/jobExecutionId[:\s]+([a-zA-Z0-9]{15,18})/i);
-      const promoMatch = submitOutput.match(/promotion_id=([a-zA-Z0-9]{15,18})/i)
-                      || submitOutput.match(/promotionId[:\s]+([a-zA-Z0-9]{15,18})/i);
-      if (jobMatch)   jobExecutionId = jobMatch[1];
-      if (promoMatch) promotionId    = promoMatch[1];
+      console.log(`  Trying: ${cmd}`);
+      return runShellCapture(cmd);
+    } catch (err) {
+      const msg = err.message || "";
+      // Only fall through if the error is "not a sf command" (wrong CLI version)
+      // Any other error (auth, network, etc.) should stop execution
+      if (msg.includes("not a sf command") || msg.includes("is not a sf command")) {
+        console.log("  Command not found in this CLI version. Trying legacy syntax...");
+        continue;
+      }
+      throw err; // Real error: re-throw it
     }
-
-    if (promotionId)    console.log(`  Promotion ID      : ${promotionId}`);
-    if (jobExecutionId) console.log(`  Job Execution ID  : ${jobExecutionId}`);
-
-  } catch (err) {
-    console.error("\nCritical Failure: story submit command failed.");
-    console.error(err.message);
-    process.exit(1);
   }
+  throw new Error("Neither sf copado story submit nor sf copado:work:submit is available. Run: sf plugins update");
+}
+
+let submitOutput = "";
+try {
+  submitOutput = runSubmit();
+  console.log("\n  CLI response received.");
+} catch (err) {
+  console.error("\nCritical Failure: story submit command failed.");
+  console.error(err.message);
+  process.exit(1);
+}
+
+// Parse the JSON response to extract IDs and status
+try {
+  const parsed   = JSON.parse(submitOutput);
+  jobExecutionId = parsed.jobExecutionId
+                || parsed.job_execution_id
+                || (parsed.jobExecution && parsed.jobExecution.id)
+                || (parsed.result && parsed.result.jobExecutionId)
+                || "";
+  promotionId    = parsed.promotionId
+                || parsed.promotion_id
+                || (parsed.promotion && parsed.promotion.id)
+                || (parsed.result && parsed.result.promotionId)
+                || "";
+  finalStatus    = (parsed.jobStatus || parsed.status || "").toUpperCase();
+} catch (_) {
+  // Not JSON: try plain text ID extraction as fallback
+  const jobMatch   = submitOutput.match(/job_execution_id=([a-zA-Z0-9]{15,18})/i)
+                  || submitOutput.match(/jobExecutionId[:\s]+([a-zA-Z0-9]{15,18})/i);
+  const promoMatch = submitOutput.match(/promotion_id=([a-zA-Z0-9]{15,18})/i)
+                  || submitOutput.match(/promotionId[:\s]+([a-zA-Z0-9]{15,18})/i);
+  if (jobMatch)   jobExecutionId = jobMatch[1];
+  if (promoMatch) promotionId    = promoMatch[1];
+}
+
+if (promotionId)    console.log(`  Promotion ID      : ${promotionId}`);
+if (jobExecutionId) console.log(`  Job Execution ID  : ${jobExecutionId}`);
+else                console.log("  WARNING: No Job Execution ID found in CLI output. Polling will use generic fallback.");
 
   // Step 5: If --wait returned a terminal status, display it directly.
   // If not (older CLI versions may not support --wait), fall back to polling.
