@@ -1,0 +1,11 @@
+{
+  "name":"copado-hx",
+  "version": "1.0.0",
+  "main": "copado-hx.js",
+  "bin": {
+     "copado-hx": "./copado-hx.js"
+  },
+  "dependencies": {
+    "dotenv": "^18.0.7"
+  }
+}
