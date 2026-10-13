@@ -4,6 +4,7 @@ const { execSync } = require('child_process');
 const fs = require('fs');
 const path = require('path');
 
+// Safe validation framework: skip gracefully if dotenv is missing in the hackathon workspace
 try { require('dotenv').config(); } catch (e) {}
 
 const [,, command, storyId] = process.argv;
@@ -12,7 +13,12 @@ const SOURCE_ORG = process.env.SOURCE_ORG || "dev1";
 const TARGET_ORG = process.env.TARGET_ORG || "qa";        
 
 if (!command || !storyId) {
-  console.log("Usage: node copado-hx.js deploy <UserStoryName>");
+  console.log("====================================================================");
+  console.log("❌ Missing execution parameters.");
+  console.log("Usage:");
+  console.log("  node copado-hx.js deploy <UserStoryName>  -> Run Headless Snapshot Release");
+  console.log("  node copado-hx.js undo <UserStoryName>    -> Trigger Local Automated Rollback");
+  console.log("====================================================================");
   process.exit(1);
 }
 
@@ -24,23 +30,27 @@ function runShellCapture(cmd) {
   return execSync(cmd, { encoding: 'utf8' }).trim();
 }
 
-// ─── DEPLOY TRACK ─────────────────────────────────────────────────────────────
+// ─── PART 1: THE HEADLESS DEPLOYMENT & AUTO-SNAPSHOT ENGINE ────────────────────
 if (command === 'deploy') {
-  console.log("\n🛫 [copado-hx] Starting deployment execution for: " + storyId);
+  console.log("\n====================================================================");
+  console.log("🛫 [copado-hx] INITIATING HEADLESS METADATA AUTOMATION ROUTINE");
+  console.log("====================================================================");
 
-  // Step 1: Align workspace context
+  // Step 1: Bind workspace tracking context
   console.log("\n📌 Step 1: Aligning Agentia tracking workspace context...");
   runShell("agentia cicd work set " + storyId);
 
-  // Step 2: Detect changed files for snapshot verification
+  // Step 2: Track code changes vs main
   console.log("\n🔍 Step 2: Scanning local branch for tracking metadata deltas...");
   let changedFiles = [];
   try {
     const gitOutput = runShellCapture("git diff --name-only origin/main");
     changedFiles = gitOutput.split('\n').filter(f => f.trim() !== '');
-  } catch (err) {}
+  } catch (err) {
+    console.log("⚠️  Git diff trace unavailable. Proceeding with clean tracking array.");
+  }
 
-  // Step 3: Capture snapshot of current QA state safely
+  // Step 3: Take Client-Side Safety Backup Snapshot from QA
   if (changedFiles.length > 0) {
     const backupPath = path.join(__dirname, '.rollback', storyId);
     fs.mkdirSync(backupPath, { recursive: true });
@@ -68,111 +78,126 @@ if (command === 'deploy') {
           const dest = path.join(backupPath, path.basename(filePath));
           fs.mkdirSync(path.dirname(dest), { recursive: true });
           fs.copyFileSync(pulledFilePath, dest);
-          console.log("  ✅ Snapshot saved successfully: " + path.basename(filePath));
+          console.log("  ✅ Pre-deployment snapshot stored: " + path.basename(filePath));
         }
-        
         fs.rmSync(tempProjectDir, { recursive: true, force: true });
       } catch (err) {
-        console.log("  ℹ️  Component skipped: Asset does not exist in target QA environment yet.");
+        console.log("  ℹ️  Component status check: Asset doesn't exist in QA yet. Skipping snapshot folder entry for: " + path.basename(filePath));
       }
     });
+  } else {
+    console.log("\n⚠️  Step 3: No changed components detected. Skipping snapshot phase.");
   }
 
-  // Step 4: Run 'work done' to trigger the single promotion & deployment instantly
+  // Step 4: Run 'work done' to finalize user story and initiate cloud deployment
   console.log("\n🔒 Step 4: Finalizing User Story state and initiating single Promotion...");
   let promotionId = "";
+  let jobExecutionId = "";
   try {
     const outputLog = runShellCapture("agentia cicd work done");
     console.log(outputLog);
 
-    const match = outputLog.match(/promotion_id=([a-zA-Z0-9]{15,18})/i);
-    if (match && match) {
-      promotionId = match[1];
-    }
+    // Extract the live IDs using explicit text pattern groupings
+    const promoMatch = outputLog.match(/promotion_id=([a-zA-Z0-9]{15,18})/i);
+    if (promoMatch && promoMatch[1]) promotionId = promoMatch[1];
+    
+    const jobMatch = outputLog.match(/job_execution_id=([a-zA-Z0-9]{15,18})/i);
+    if (jobMatch && jobMatch[1]) jobExecutionId = jobMatch[1];
   } catch (err) {
-    console.error("❌ Failed to complete work done milestone configuration.");
+    console.error("❌ Critical Failure during work serialization milestone execution.");
     process.exit(1);
   }
 
-  // Step 5: Real-time Cloud Deployment Status Polling via Native JSON Parsing
+  // Step 5: Dual-Track Multi-Layer Polling Monitor
   console.log("\n🚀 Step 5: Monitoring active deployment tracking logs from Copado Cloud...");
-  
   let isRunning = true;
   let checkCount = 0;
-  const maxChecks = 60; // 10-minute maximum safety loop boundary window
+  const maxChecks = 60; 
 
   while (isRunning && checkCount < maxChecks) {
+    let rawJsonText = "";
+    let rawStatusText = "";
+    let jobStatus = "IN PROGRESS";
+
+    // 1. Attempt strict data parameter check via JSON
     try {
-      // FIXED: Query work status in pure JSON format to bypass text-parsing gaps entirely
-      const rawJson = runShellCapture("agentia cicd work status --json");
-      const statusObj = JSON.parse(rawJson);
+      rawJsonText = runShellCapture("agentia cicd work status --json");
+      const statusObj = JSON.parse(rawJsonText);
       
-      // Extract structural properties depending on active user story array layout structures
-      let jobStatus = "";
-      if (statusObj && statusObj.status) {
-         jobStatus = statusObj.status;
-      } else if (statusObj && statusObj.latestJobStatus) {
-         jobStatus = statusObj.latestJobStatus;
-      } else if (statusObj && statusObj.executionStatus) {
-         jobStatus = statusObj.executionStatus;
-      }
-
-      console.log(`  [Live Update] Cloud System Job State: ${jobStatus || "IN PROGRESS"}...`);
-
-      // Evaluate the pure backend variable keys cleanly
-      if (jobStatus === "Success" || jobStatus === "Completed" || jobStatus === "Done") {
-         console.log("\n🎉 STATUS UPDATE: Deployment COMPLETED SUCCESSFULLY in QA!");
-         isRunning = false;
-         break;
-      } else if (jobStatus === "Failed" || jobStatus === "Error" || jobStatus === "Completed with errors") {
-         console.log("\n❌ STATUS UPDATE: Deployment COMPLETED WITH ERRORS. Review your validation rules.");
-         isRunning = false;
-         break;
+      if (statusObj) {
+        if (statusObj.jobExecution && statusObj.jobExecution.id === jobExecutionId) {
+          jobStatus = statusObj.jobExecution.status || "IN PROGRESS";
+        } else if (Array.isArray(statusObj.steps)) {
+          const matchingStep = statusObj.steps.find(s => s.jobExecutionId === jobExecutionId || s.id === jobExecutionId);
+          if (matchingStep) jobStatus = matchingStep.status || "IN PROGRESS";
+        } else if (statusObj.status) {
+          jobStatus = statusObj.status;
+        }
       }
     } catch (e) {
-      // Soft text check fallback context block if JSON formatting changes natively mid-run
-      try {
-        const rawStatusText = runShellCapture("agentia cicd work status");
-        const statusBlock = rawStatusText.replace(/Fetching status.*?\.\.\.\s*done/gi, "").trim();
-        
-        if (statusBlock.includes("Success") || statusBlock.includes("Completed")) {
-          console.log("\n🎉 STATUS UPDATE: Deployment COMPLETED SUCCESSFULLY in QA!");
-          isRunning = false;
-          break;
-        } else if (statusBlock.includes("Failed") || statusBlock.includes("Error")) {
-          console.log("\n❌ STATUS UPDATE: Deployment COMPLETED WITH ERRORS.");
-          isRunning = false;
-          break;
-        } else {
-          console.log("  [Live Update] Deployment Status: IN PROGRESS...");
-        }
-      } catch (err) {
-        console.log("  [Live Update] Deployment Status: IN PROGRESS...");
+      jobStatus = "IN PROGRESS"; // Reset status to fallback text checking if JSON stream glitches
+    }
+
+    // 2. Cross-verify using direct Text Stream Evaluation to guarantee results
+    try {
+      rawStatusText = runShellCapture("agentia cicd work status");
+      const cleanBlock = rawStatusText.replace(/Fetching status.*?\.\.\.\s*done/gi, "").trim();
+
+      // Normalize all values to uppercase to prevent casing mismatches
+      const checkString = (cleanBlock + " " + jobStatus).toUpperCase();
+
+      if (checkString.includes("SUCCESS") || checkString.includes("COMPLETED") || checkString.includes("SUCCESSFUL")) {
+         console.log("\n🎉 STATUS UPDATE: Deployment COMPLETED SUCCESSFULLY in QA environment!");
+         isRunning = false;
+         break;
+      } 
+      else if (checkString.includes("FAIL") || checkString.includes("ERROR") || checkString.includes("CONFLICT")) {
+         console.log("\n❌ STATUS UPDATE: Deployment FAILED WITH ERRORS. Review your validation constraints.");
+         isRunning = false;
+         break;
+      } 
+      else {
+         console.log("  [Live Update] Cloud System Job State: IN PROGRESS...");
       }
+    } catch (err) {
+      console.log("  [Live Update] Cloud System Job State: IN PROGRESS...");
     }
 
     if (isRunning) {
-      execSync("powershell -Command \"Start-Sleep -s 12\""); // Dynamic poll frequency spacing interval
+      execSync("powershell -Command \"Start-Sleep -s 12\""); 
       checkCount++;
     }
   }
 
   if (isRunning) {
-    console.log("\n⏳ Monitoring timeout window reached. Please verify final results in your browser tab.");
+    console.log("\n⏳ Polling window closed. Verify final states inside your browser tab.");
   }
 }
 
-// ─── UNDO TRACK ───────────────────────────────────────────────────────────────
+// ─── PART 2: THE TRACK D EMERGENCY RECOVERY ROLLBACK ENGINE ────────────────────
 else if (command === 'undo') {
-  console.log("\n🔄 [copado-hx] Running local headless recovery snapshot for: " + storyId);
+  console.log("\n====================================================================");
+  console.log("🔄 [copado-hx] INITIATING AGENTIC SNAPSHOT ROLLBACK RECOVERY");
+  console.log("====================================================================");
+  
   const backupPath = path.join(__dirname, '.rollback', storyId);
 
   if (fs.existsSync(backupPath)) {
+    console.log(`\n📡 Step 1: Extracting local baseline snapshots from folder storage: .rollback/${storyId}`);
+    console.log(`Force-deploying historical manifests back into target sandbox environment [${TARGET_ORG}]...`);
     try {
-      runShell("sf project deploy start --source-dir \"" + backupPath + "\" --target-org " + TARGET_ORG);
-      console.log("\n✅ Success: Custom local snapshot deployed cleanly to QA.");
+      // Overwrites QA back to its old state using the local backup snapshot files
+      runShell(`sf project deploy start --source-dir "${backupPath}" --target-org ${TARGET_ORG}`);
+      console.log("\n====================================================================");
+      console.log("🎉 SUCCESS: TARGET SANDBOX ENVIRONMENT SUCCESSFULLY ROLLED BACK!");
+      console.log("====================================================================");
     } catch (err) {
-      console.error("❌ Snapshot restore run failed.");
+      console.error("\n❌ Critical Failure: Local snapshot deployment recovery failed.");
+      process.exit(1);
     }
+  } else {
+    console.log(`\n❌ Execution Stopped: No local backup snapshot profile found for work item: ${storyId}`);
+    console.log("Verify that a successful deployment script run completed before calling undo.");
+    process.exit(1);
   }
 }
