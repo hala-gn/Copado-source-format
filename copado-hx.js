@@ -87,75 +87,61 @@ if (command === 'deploy') {
 
     const match = outputLog.match(/promotion_id=([a-zA-Z0-9]{15,18})/i);
     if (match && match) {
-      promotionId = match[1];
+      promotionId = match;
     }
   } catch (err) {
     console.error("❌ Failed to complete work done milestone configuration.");
     process.exit(1);
   }
 
-  // Step 5: Live Intelligent Monitoring via Validated 'agentia cicd pipeline list' Command
-  if (promotionId) {
-    console.log("\n🚀 Step 5: Promotion [" + promotionId + "] successfully generated and running in cloud...");
-    console.log("⏳ Monitoring deployment progress live from Copado Cloud API...");
-    
-    let isRunning = true;
-    let checkCount = 0;
-    const maxChecks = 60; 
+  // Step 5: Real-time Cloud Deployment Status Polling
+  console.log("\n🚀 Step 5: Monitoring active deployment tracking logs from Copado Cloud...");
+  
+  let isRunning = true;
+  let checkCount = 0;
+  const maxChecks = 60; // 60 checks * 10s sleep = 10 minutes maximum window limit
 
-    while (isRunning && checkCount < maxChecks) {
-      try {
-        // FIXED SYNTAX: Querying the fully supported beta.5 pipeline command namespace
-        const rawJson = runShellCapture("agentia cicd pipeline list --json");
-        const pipelineData = JSON.parse(rawJson);
-        
-        let targetPromotion = null;
-        if (Array.isArray(pipelineData)) {
-            targetPromotion = pipelineData.find(p => p.id === promotionId || p.promotionId === promotionId || p.latestPromotionId === promotionId);
-        } else if (pipelineData && pipelineData.promotions) {
-            targetPromotion = pipelineData.promotions.find(p => p.id === promotionId || p.promotionId === promotionId);
-        }
+  while (isRunning && checkCount < maxChecks) {
+    try {
+      // Pull down the comprehensive text logs from the active work status channel
+      const rawStatusText = runShellCapture("agentia cicd work status");
+      
+      // Clean out the background terminal task headers to look exclusively at the execution results
+      const statusBlock = rawStatusText.replace(/Fetching status.*?\.\.\.\s*done/gi, "").trim();
 
-        if (targetPromotion) {
-            const currentStatus = targetPromotion.status || targetPromotion.executionStatus || targetPromotion.stage || "";
-            console.log(`  [Live Poll] Pipeline Task State: ${currentStatus}...`);
-
-            if (currentStatus.includes("Success") || currentStatus.includes("Completed") || currentStatus === "Done") {
-                console.log("\n🎉 STATUS UPDATE: Deployment COMPLETED SUCCESSFULLY in QA!");
-                isRunning = false;
-            } else if (currentStatus.includes("Failed") || currentStatus.includes("Error")) {
-                console.log("\n❌ STATUS UPDATE: Deployment FAILED WITH ERRORS in QA sandbox.");
-                isRunning = false;
-            }
-        } else {
-            // Check status via secondary text-scrape strategy if clear of queue array completely
-            const textReport = runShellCapture("agentia cicd pipeline list");
-            if (!textReport.includes(promotionId)) {
-               console.log("\n🎉 STATUS UPDATE: Pipeline verification confirms task deployment finalized successfully!");
-               isRunning = false;
-            } else {
-               process.stdout.write(".");
-            }
-        }
-      } catch (e) {
-        // Soft fallback mechanism if pipeline status transitions quickly
-        try {
-          const textReport = runShellCapture("agentia cicd pipeline list");
-          if (!textReport.includes(promotionId)) {
-            console.log("\n🎉 STATUS UPDATE: Deployment COMPLETED SUCCESSFULLY in QA!");
-            isRunning = false;
-          }
-        } catch (err) {}
+      // Case 1: Detect explicit Active deployment tracks
+      if (statusBlock.includes("In Progress") || statusBlock.includes("Running") || statusBlock.includes("Submitting")) {
+         console.log("  [Live Update] Deployment Status: IN PROGRESS...");
+      } 
+      // Case 2: Detect clear cloud failure indicators
+      else if (statusBlock.includes("Failed") || statusBlock.includes("Error") || statusBlock.includes("with errors")) {
+         console.log("\n❌ STATUS UPDATE: Deployment COMPLETED WITH ERRORS. Review your validation rules.");
+         isRunning = false;
+         break;
+      } 
+      // Case 3: Detect clear execution success states
+      else if (statusBlock.includes("Success") || statusBlock.includes("Completed") || statusBlock.includes("done")) {
+         console.log("\n🎉 STATUS UPDATE: Deployment COMPLETED SUCCESSFULLY in QA!");
+         isRunning = false;
+         break;
+      } 
+      // Default: If the buffer is completely empty or transient, consider it processing in the pipe
+      else {
+         console.log("  [Live Update] Deployment Status: IN PROGRESS...");
       }
-
-      if (isRunning) {
-        execSync("powershell -Command \"Start-Sleep -s 12\""); 
-        checkCount++;
-      }
+    } catch (e) {
+      // Protect against transient network drops by assuming it's still running
+      console.log("  [Live Update] Deployment Status: IN PROGRESS...");
     }
-  } else {
-    console.error("\n❌ Critical Failure: Could not track the auto-generated Promotion ID.");
-    process.exit(1);
+
+    if (isRunning) {
+      execSync("powershell -Command \"Start-Sleep -s 10\""); // Wait 10 seconds before polling the API again
+      checkCount++;
+    }
+  }
+
+  if (isRunning) {
+    console.log("\n⏳ Monitoring timeout window reached. Please verify final results in your browser tab.");
   }
 }
 
