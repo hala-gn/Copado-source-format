@@ -199,23 +199,29 @@ function pollUntilDone(jobExecutionId) {
 
 // ─── submit (new syntax first, legacy fallback) ──────────────────────────────
 function submitStory() {
-  const cmds = [
-    'sf copado story submit --promote --deploy --json',   // CLI v3.12+
-    'sf copado:work:submit --promote --deploy --json'     // CLI < v3.12
-  ];
+  // COPADO_SUBMIT_CMD in .env overrides everything (use the exact command that works in your terminal).
+  const cmds = process.env.COPADO_SUBMIT_CMD
+    ? [process.env.COPADO_SUBMIT_CMD]
+    : [
+        'sf copado story submit --promote --deploy --json',   // CLI v3.12+
+        'sf copado:work:submit --promote --deploy --json'     // CLI < v3.12
+      ];
+  const errors = [];
   for (const cmd of cmds) {
     console.log(`  Trying: ${cmd}`);
     const r = capture(cmd);
     if (r.ok) return r.out;
-    const msg = `${r.err}\n${r.out}`;
-    if (/is not a sf command|command .* not found/i.test(msg)) {
-      console.log('  Not available in this CLI version, trying legacy syntax...');
-      continue;
-    }
-    const parsed = tryJson(r.out);
-    throw new Error((parsed && (parsed.message || findKey(parsed, ['message']))) || msg.trim());
+    const msg = `${r.err}\n${r.out}`.trim();
+    console.log('  --- CLI said ---');
+    console.log('  ' + msg.split('\n').slice(0, 12).join('\n  '));
+    console.log('  ----------------');
+    errors.push(`${cmd}\n${msg}`);
+    // keep trying the next syntax only when the command itself is unknown
+    if (!/is not a sf command|not a valid command|command .* not found|Unknown command/i.test(msg)) break;
   }
-  throw new Error('Neither "sf copado story submit" nor "sf copado:work:submit" exists. Run: sf plugins update');
+  throw new Error(
+    'Story submit failed. Run these in your terminal to find the right command, then set COPADO_SUBMIT_CMD in .env:\n' +
+    '  sf plugins\n  sf copado --help\n  sf copado story --help\n\n' + errors.join('\n\n'));
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
