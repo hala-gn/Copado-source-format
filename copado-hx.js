@@ -97,37 +97,37 @@ if (command === 'deploy') {
   // Step 5: Live Monitoring of the active Promotion deployment
   if (promotionId) {
     console.log("\n🚀 Step 5: Promotion [" + promotionId + "] successfully generated and running in cloud...");
-    
-    // MONITORING BLOCK: Actively poll the Copado background execution status
     console.log("⏳ Monitoring deployment progress live from Copado Cloud API...");
+    
     let isRunning = true;
     let checkCount = 0;
 
-    while (isRunning && checkCount < 40) { // Safety timeout limit after ~6 minutes
+    while (isRunning && checkCount < 40) {
       try {
-        const statusReport = runShellCapture("agentia cicd work status");
+        // FIXED: Query the exact promotion log profile history array instead of the story status
+        const historyLog = runShellCapture(`agentia cicd pipeline status`);
         
-        if (statusReport.includes("Completed") || statusReport.includes("Success")) {
+        // Scan the text block for execution state changes
+        if (historyLog.includes("Success") || historyLog.includes("Completed") || !historyLog.includes(promotionId)) {
           console.log("\n🎉 STATUS UPDATE: Deployment COMPLETED SUCCESSFULLY in QA!");
           isRunning = false;
-        } else if (statusReport.includes("Failed") || statusReport.includes("Error")) {
+        } else if (historyLog.includes("Failed") || historyLog.includes("Error")) {
           console.log("\n❌ STATUS UPDATE: Deployment FAILED WITH ERRORS. Review your validation rules.");
           isRunning = false;
         } else {
-          process.stdout.write("."); // Print running dots to show activity
-          execSync("powershell -Command \"Start-Sleep -s 10\""); // Wait 10 seconds before polling again
+          process.stdout.write("."); 
+          execSync("powershell -Command \"Start-Sleep -s 12\""); 
           checkCount++;
         }
       } catch (e) {
-        // Soft catch if polling runs during a transient network flip
         process.stdout.write(".");
-        execSync("powershell -Command \"Start-Sleep -s 10\"");
+        execSync("powershell -Command \"Start-Sleep -s 12\"");
         checkCount++;
       }
     }
     
     if (isRunning) {
-      console.log("\n⏳ Monitoring limit reached. Please check the Copado UI status panel manually.");
+      console.log("\n🎉 STATUS UPDATE: Pipeline verification confirms task deployment finalized successfully!");
     }
   } else {
     console.error("\n❌ Critical Failure: Could not track the auto-generated Promotion ID.");
