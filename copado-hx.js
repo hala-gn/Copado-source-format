@@ -40,27 +40,23 @@ if (command === 'deploy') {
     changedFiles = gitOutput.split('\n').filter(f => f.trim() !== '');
   } catch (err) {}
 
-  // Step 3: Capture snapshot of current QA state safely (FIXED SF CLI SYNTAX)
+  // Step 3: Capture snapshot of current QA state safely
   if (changedFiles.length > 0) {
     const backupPath = path.join(__dirname, '.rollback', storyId);
     fs.mkdirSync(backupPath, { recursive: true });
     console.log("\n📸 Step 3: Extracting snapshot tracking baseline into .rollback/" + storyId + "...");
 
     changedFiles.forEach(function(filePath) {
-      // Basic safeguard: don't snapshot your own script files
       if (filePath.includes('copado-hx.js') || filePath.includes('.env')) return;
 
       try {
-        // FIXED: Create an isolated workspace directory mimicking a clean SF project layout
         const tempProjectDir = path.join(__dirname, '.temp_sf_project_' + Math.random().toString(36).substring(7));
         fs.mkdirSync(path.join(tempProjectDir, 'force-app'), { recursive: true });
         
-        // Copy the project file structure metadata so 'sf' accepts it as an isolated environment
         if (fs.existsSync('sfdx-project.json')) {
           fs.copyFileSync('sfdx-project.json', path.join(tempProjectDir, 'sfdx-project.json'));
         }
 
-        // Run retrieve using ONLY --source-dir targeted at our isolated mock folder project
         execSync(`sf project retrieve start --source-dir "${filePath}" --target-org ${TARGET_ORG}`, { 
           cwd: tempProjectDir,
           encoding: 'utf8',
@@ -75,7 +71,6 @@ if (command === 'deploy') {
           console.log("  ✅ Snapshot saved successfully: " + path.basename(filePath));
         }
         
-        // Wipe out the clean temporary folder space
         fs.rmSync(tempProjectDir, { recursive: true, force: true });
       } catch (err) {
         console.log("  ℹ️  Component skipped: Asset does not exist in target QA environment yet.");
@@ -83,8 +78,8 @@ if (command === 'deploy') {
     });
   }
 
-  // Step 4: Run 'work done' and capture the live terminal output to extract the true Promotion ID
-  console.log("\n🔒 Step 4: Finalizing User Story state and capturing single Promotion ID...");
+  // Step 4: Run 'work done' to trigger the single promotion & deployment instantly
+  console.log("\n🔒 Step 4: Finalizing User Story state and initiating single Promotion...");
   let promotionId = "";
   try {
     const outputLog = runShellCapture("agentia cicd work done");
@@ -99,39 +94,43 @@ if (command === 'deploy') {
     process.exit(1);
   }
 
-  // Step 5: Push promotion and monitor status directly in VS Code
+  // Step 5: Live Monitoring of the active Promotion deployment
   if (promotionId) {
-    console.log("\n🚀 Step 5: Running single Promotion execution [" + promotionId + "] to QA...");
-    try {
-      // Trigger the promotion run
-      runShell("agentia cicd promotion run " + promotionId + " --operation merge_and_deploy -y");
-      
-      // MONITORING BLOCK: Actively poll the Copado background execution status
-      console.log("\n⏳ Monitoring deployment progress live from Copado Cloud API...");
-      let isRunning = true;
-      let checkCount = 0;
+    console.log("\n🚀 Step 5: Promotion [" + promotionId + "] successfully generated and running in cloud...");
+    
+    // MONITORING BLOCK: Actively poll the Copado background execution status
+    console.log("⏳ Monitoring deployment progress live from Copado Cloud API...");
+    let isRunning = true;
+    let checkCount = 0;
 
-      while (isRunning && checkCount < 30) { // Safety timeout limit after ~5 minutes
+    while (isRunning && checkCount < 40) { // Safety timeout limit after ~6 minutes
+      try {
         const statusReport = runShellCapture("agentia cicd work status");
         
         if (statusReport.includes("Completed") || statusReport.includes("Success")) {
           console.log("\n🎉 STATUS UPDATE: Deployment COMPLETED SUCCESSFULLY in QA!");
           isRunning = false;
         } else if (statusReport.includes("Failed") || statusReport.includes("Error")) {
-          console.log("\n❌ STATUS UPDATE: Deployment FAILED WITH ERRORS. Review validation rules.");
+          console.log("\n❌ STATUS UPDATE: Deployment FAILED WITH ERRORS. Review your validation rules.");
           isRunning = false;
         } else {
           process.stdout.write("."); // Print running dots to show activity
           execSync("powershell -Command \"Start-Sleep -s 10\""); // Wait 10 seconds before polling again
           checkCount++;
         }
+      } catch (e) {
+        // Soft catch if polling runs during a transient network flip
+        process.stdout.write(".");
+        execSync("powershell -Command \"Start-Sleep -s 10\"");
+        checkCount++;
       }
-    } catch (err) {
-      console.error("❌ Promotion pipeline deployment run failed.");
-      process.exit(1);
+    }
+    
+    if (isRunning) {
+      console.log("\n⏳ Monitoring limit reached. Please check the Copado UI status panel manually.");
     }
   } else {
-    console.error("\n❌ Critical Failure: Could not catch the auto-generated Promotion ID from Step 4.");
+    console.error("\n❌ Critical Failure: Could not track the auto-generated Promotion ID.");
     process.exit(1);
   }
 }
